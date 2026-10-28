@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     app_secret_key: SecretStr
     database_url: str = "postgresql+psycopg://jobs:jobs@localhost:5432/jobs"
     redis_url: str = "redis://localhost:6379/0"
-    profile_path: str = "profile.yaml"
+    profile_path: str = "/etc/secrets/profile.yaml"
     artifacts_path: str = "private-artifacts"
     log_level: str = "INFO"
     discovery_boards: str = ""
