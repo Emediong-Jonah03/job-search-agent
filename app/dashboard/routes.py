@@ -1,6 +1,7 @@
 import html
 import hashlib
 import json
+import logging
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,10 +24,13 @@ from app.db.models import (
     VerificationSignalRecord,
 )
 from app.db.session import SessionLocal
+from app.documents.service import DocumentGenerationError, generate_application_documents
 from app.documents.models import ApplicationDocumentContent
 from app.documents.revisions import DocumentRevisionError, revise_application_document
-from app.domain.models import ApplicationState
+from app.domain.application_service import ApplicationNotFound, transition_application
+from app.domain.models import ApplicationState, StateTransitionRequest
 from app.domain.state_machine import InvalidTransition, transition
+from app.llm.providers import LLMProviderError
 from app.profile.loader import ProfileLoadError, load_profile
 from app.submission.browser import HostedFormBrowser
 from app.submission.planning import SubmissionBlocked, build_submission_plan, resolve_plan_value
@@ -35,6 +39,7 @@ from app.tracking.follow_ups import schedule_confirmed_submission
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 STATE_NAMES = [item.value for item in ApplicationState]
 DOCUMENT_PATHS = {
     "cv-pdf": ("cv_pdf_path", "application/pdf", True),
@@ -273,7 +278,7 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
         body += f'<option value="{_e(name)}"{selected}>{_e(name.replace("_", " ").title())}</option>'
     body += '</select> <button class="secondary" type="submit">Filter</button></form></div>'
     if not rows:
-        body += '<p class="muted">No applications match this filter yet. Job discovery runs from configured boards.</p>'
+        body += '<p class="muted">No applications match this filter. Jobs are added by the scheduled ARQ discovery worker, which must be running separately from this web service.</p>'
     else:
         body += '<div class="table-wrap"><table><thead><tr><th>Role</th><th>State</th><th>Match</th><th>Verification</th><th>Documents</th><th>Actions</th></tr></thead><tbody>'
         for application, job in rows:
@@ -304,6 +309,79 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
         body += '</tbody></table></div>'
     body += '</section><p class="footer-note">Approval and submission confirmation are per application. Uncertain outcomes require manual reconciliation.</p>'
     return _layout(request, "Applications", body)
+
+
+@router.post("/applications/{application_id}/shortlist", include_in_schema=False)
+async def shortlist_application(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    redirect = _require_user(request)
+    if redirect:
+        return redirect
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm", [""])[0] != "yes":
+        raise HTTPException(status_code=422, detail="Confirm that you want to shortlist this application")
+    application = session.get(Application, application_id)
+    if application is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    job = session.get(Job, application.job_id)
+    if job is None or job.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verification = _latest_verification(session, job.id)
+    if application.state != ApplicationState.VERIFIED.value:
+        raise HTTPException(status_code=409, detail="Only a verified application can be shortlisted")
+    if verification is None or verification.classification != "VERIFIED":
+        raise HTTPException(status_code=409, detail="The latest posting assessment is not VERIFIED")
+    session.rollback()
+    try:
+        transition_application(
+            session,
+            application_id,
+            StateTransitionRequest(
+                target=ApplicationState.SHORTLISTED,
+                actor="dashboard-user",
+                reason="Manually shortlisted from the review dashboard",
+            ),
+        )
+    except (ApplicationNotFound, InvalidTransition) as exc:
+        raise HTTPException(status_code=409, detail="Application state changed; reload and review it again") from exc
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/generate-documents", include_in_schema=False)
+async def generate_documents(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    redirect = _require_user(request)
+    if redirect:
+        return redirect
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm", [""])[0] != "yes":
+        raise HTTPException(status_code=422, detail="Confirm document generation")
+    application = session.get(Application, application_id)
+    if application is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    job = session.get(Job, application.job_id)
+    if job is None or job.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if application.state not in {ApplicationState.SHORTLISTED.value, ApplicationState.CV_GENERATED.value}:
+        raise HTTPException(status_code=409, detail="Shortlist this application before generating documents")
+    verification = _latest_verification(session, job.id)
+    if verification is None or verification.classification != "VERIFIED":
+        raise HTTPException(status_code=409, detail="The latest posting assessment is not VERIFIED")
+    session.rollback()
+    profile = _profile()
+    try:
+        await generate_application_documents(session, application_id, profile)
+    except DocumentGenerationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LLMProviderError as exc:
+        raise HTTPException(status_code=502, detail="The configured language model could not analyze this job") from exc
+    except Exception as exc:
+        logger.error(
+            "Document generation failed",
+            extra={"application_id": str(application_id), "error_type": type(exc).__name__},
+        )
+        raise HTTPException(status_code=500, detail="Document generation failed; check the service logs") from exc
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
 
 
 @router.get("/follow-ups", response_class=HTMLResponse, include_in_schema=False)
@@ -464,7 +542,11 @@ def application_detail(application_id: UUID, request: Request, session: Session 
             body += '<details><summary>Edit structured document source</summary><p class="muted">Edits create a new immutable version. Personal claims must remain exact facts from the profile; unsupported edits are rejected. Editing invalidates any previous approval.</p>'
             body += f'<form method="post" action="/applications/{application.id}/documents/{document.id}/revise">{csrf}<label for="content_json">Document source JSON</label><textarea id="content_json" name="content_json" spellcheck="false">{_e(raw_json)}</textarea><button type="submit">Validate and save new version</button></form></details>'
     else:
-        body += '<p class="muted">No generated documents are available for this application.</p>'
+        body += '<p class="muted">No generated documents are available for this application yet.</p>'
+        if application.state == ApplicationState.VERIFIED.value and verification and verification.classification == "VERIFIED":
+            body += f'<p>Review the verified posting, then shortlist it to continue.</p><form method="post" action="/applications/{application.id}/shortlist">{csrf}<label><input type="checkbox" name="confirm" value="yes" required> I reviewed this verified posting and want to shortlist it.</label><p><button type="submit">Shortlist this job</button></p></form>'
+        elif application.state in {ApplicationState.SHORTLISTED.value, ApplicationState.CV_GENERATED.value}:
+            body += f'<p>Generate a profile-backed CV and cover letter for this shortlisted job.</p><form method="post" action="/applications/{application.id}/generate-documents">{csrf}<label><input type="checkbox" name="confirm" value="yes" required> Generate and save the CV and cover letter for my review.</label><p><button type="submit">Generate CV and cover letter</button></p></form>'
     body += '</section>'
     body += '<section class="card"><h2>Screening questions</h2>'
     if questions:
