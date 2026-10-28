@@ -86,3 +86,39 @@ class SubmissionAttempt(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
+
+class JobVerification(Base):
+    __tablename__ = "job_verifications"
+    __table_args__ = (
+        Index("ix_job_verifications_job_time", "job_id", "assessed_at"),
+        Index("ix_job_verifications_classification", "classification"),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    application_id: Mapped[UUID | None] = mapped_column(ForeignKey("applications.id", ondelete="SET NULL"))
+    classification: Mapped[str] = mapped_column(String(20), nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    support_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    risk_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    reasons: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    missing_evidence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    uncertainty: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    policy_parameters: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    assessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class VerificationSignalRecord(Base):
+    __tablename__ = "verification_signals"
+    __table_args__ = (Index("ix_verification_signals_assessment", "verification_id"),)
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    verification_id: Mapped[UUID] = mapped_column(ForeignKey("job_verifications.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    weight: Mapped[int] = mapped_column(Integer, nullable=False)
+    finding: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_url: Mapped[str | None] = mapped_column(Text)
+    data_source: Mapped[str] = mapped_column(String(100), nullable=False)
+    reliability: Mapped[float] = mapped_column()
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+

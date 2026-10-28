@@ -44,13 +44,19 @@ Greenhouse's public Job Board API supports unauthenticated GET requests for publ
 
 The deterministic match score considers skill overlap, target role, experience/seniority, workplace/location preferences, work-authorization evidence when the location gives a direct country match, and compatible disclosed salary. It returns an explanation, matched/missing profile skills, and explicit conflicts. Unknown job data remains uncertain. The score is a ranking aid and does not decide whether an application is submitted.
 
+## Employer and posting verification (Phase 3)
+
+Discovery runs a deterministic evidence assessment after new source data is saved. It stores the classification, support/risk totals, individual weighted signals, evidence URLs, reliability, timestamps, missing evidence, uncertainty, and policy version/parameters. `VERIFIED` requires the configured minimum score and successful recognized-ATS-feed, original-link, and ATS-host evidence. `PROBABLE` remains in `DISCOVERED` for human review. `SUSPICIOUS` moves a pre-submission application to `REJECTED_BY_VERIFICATION`. Thresholds default to 70 for verified and 40 risk points for suspicious; set `VERIFICATION_VERIFIED_THRESHOLD` and `VERIFICATION_SUSPICIOUS_RISK_THRESHOLD` to override them.
+
+The verification score means the posting was supported by accessible ATS evidence. It does not establish that the employer is trustworthy. Current scoring rules and limitations are documented in [docs/verification-methodology.md](docs/verification-methodology.md).
+
 Official source documentation: [Greenhouse Job Board API](https://docs.greenhouse.io/job-board), [Lever public Postings API](https://github.com/lever/postings-api), [Ashby Job Postings API](https://developers.ashbyhq.com/docs/public-job-posting-api).
 
 ## Phase 1 foundation
 
 Included: Docker services for FastAPI, PostgreSQL, Redis, and ARQ; environment-backed settings; foundational database entities and migration; Pydantic profile and workflow models; explicit state transition validation; redaction helper for audit payloads; liveness/readiness endpoints.
 
-Not yet included: authenticated review UI, employer verification scoring, LLM providers, document renderers, submission adapters, reminder scheduling, and production secrets/session management. No real job application is submitted by the system in these phases.
+Not yet included: authenticated review UI, LLM providers, document renderers, submission adapters, reminder scheduling, and production secrets/session management. No real job application is submitted by the system in these phases.
 
 ## Security and operations
 

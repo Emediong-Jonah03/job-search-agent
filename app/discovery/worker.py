@@ -11,6 +11,7 @@ from app.discovery.service import check_live_link, fresh_jobs, parse_board_confi
 from app.discovery.repository import persist_discovery
 from app.matching.scorer import score_job
 from app.profile.loader import load_profile
+from app.verification.service import verify_unassessed_discovered_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ async def discover_configured_boards(_: dict) -> dict[str, int]:
             else:
                 duplicate_count += 1
 
+    assessed_count = verify_unassessed_discovered_jobs(SessionLocal)
     return {
         "boards": len(board_configs),
         "fetched": fetched_count,
@@ -75,5 +77,6 @@ async def discover_configured_boards(_: dict) -> dict[str, int]:
         "duplicates": duplicate_count,
         "excluded": rejected_count,
         "source_errors": errors,
+        "verification_assessments": assessed_count,
     }
 

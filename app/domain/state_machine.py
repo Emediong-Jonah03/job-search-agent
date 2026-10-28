@@ -9,11 +9,11 @@ class InvalidTransition(ValueError):
 
 TRANSITIONS: dict[ApplicationState, frozenset[ApplicationState]] = {
     ApplicationState.DISCOVERED: frozenset({ApplicationState.VERIFIED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
-    ApplicationState.VERIFIED: frozenset({ApplicationState.SHORTLISTED, ApplicationState.SKIPPED}),
-    ApplicationState.SHORTLISTED: frozenset({ApplicationState.CV_GENERATED, ApplicationState.SKIPPED}),
-    ApplicationState.CV_GENERATED: frozenset({ApplicationState.AWAITING_APPROVAL, ApplicationState.SHORTLISTED, ApplicationState.SKIPPED}),
-    ApplicationState.AWAITING_APPROVAL: frozenset({ApplicationState.APPROVED, ApplicationState.CV_GENERATED, ApplicationState.SKIPPED}),
-    ApplicationState.APPROVED: frozenset({ApplicationState.SUBMITTED, ApplicationState.CV_GENERATED, ApplicationState.SKIPPED}),
+    ApplicationState.VERIFIED: frozenset({ApplicationState.SHORTLISTED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
+    ApplicationState.SHORTLISTED: frozenset({ApplicationState.CV_GENERATED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
+    ApplicationState.CV_GENERATED: frozenset({ApplicationState.AWAITING_APPROVAL, ApplicationState.SHORTLISTED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
+    ApplicationState.AWAITING_APPROVAL: frozenset({ApplicationState.APPROVED, ApplicationState.CV_GENERATED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
+    ApplicationState.APPROVED: frozenset({ApplicationState.SUBMITTED, ApplicationState.CV_GENERATED, ApplicationState.REJECTED_BY_VERIFICATION, ApplicationState.SKIPPED}),
     ApplicationState.SUBMITTED: frozenset({ApplicationState.FOLLOW_UP}),
     ApplicationState.FOLLOW_UP: frozenset(),
     ApplicationState.REJECTED_BY_VERIFICATION: frozenset(),

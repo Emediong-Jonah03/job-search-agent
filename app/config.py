@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 from pydantic import SecretStr
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     artifacts_path: str = "private-artifacts"
     log_level: str = "INFO"
     discovery_boards: str = ""
+    verification_verified_threshold: int = Field(default=70, ge=1, le=100)
+    verification_suspicious_risk_threshold: int = Field(default=40, ge=1, le=1000)
 
 
 @lru_cache
