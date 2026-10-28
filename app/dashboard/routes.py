@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -52,6 +52,40 @@ DOCUMENT_PATHS = {
 def get_db():
     with SessionLocal() as session:
         yield session
+
+
+async def _run_manual_discovery(lock_token: str) -> None:
+    client = Redis.from_url(get_settings().redis_url, decode_responses=True)
+    lock_key = "discovery:manual:lock"
+    status_key = "discovery:manual:status"
+    try:
+        from app.discovery.worker import discover_configured_boards
+
+        result = await discover_configured_boards({})
+        summary = (
+            f"Search complete: {result['created']} new jobs, {result['duplicates']} duplicates, "
+            f"{result['source_errors']} source errors."
+        )
+        await client.set(status_key, summary, ex=600)
+        logger.info("Manual job discovery completed", extra={"result": result})
+    except Exception as exc:
+        try:
+            await client.set(status_key, "Search failed. Check the application logs for details.", ex=600)
+        except RedisError:
+            logger.exception("Could not save manual discovery failure status")
+        logger.exception("Manual job discovery failed", extra={"error_type": type(exc).__name__})
+    finally:
+        try:
+            await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                lock_key,
+                lock_token,
+            )
+        except RedisError:
+            logger.exception("Could not release manual discovery lock")
+        finally:
+            await client.aclose()
 
 
 def _e(value: object) -> str:
@@ -254,8 +288,47 @@ async def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+@router.post("/discovery/run", include_in_schema=False)
+async def run_discovery(request: Request, background_tasks: BackgroundTasks):
+    redirect = _require_user(request)
+    if redirect:
+        return redirect
+    data = await _form(request)
+    _check_csrf(request, data)
+    settings = get_settings()
+    if not settings.discovery_boards.strip():
+        return RedirectResponse("/dashboard?discovery=unconfigured", status_code=303)
+
+    client = Redis.from_url(settings.redis_url, decode_responses=True)
+    lock_key = "discovery:manual:lock"
+    status_key = "discovery:manual:status"
+    lock_token = secrets.token_urlsafe(24)
+    try:
+        acquired = await client.set(lock_key, lock_token, nx=True, ex=2700)
+        if not acquired:
+            return RedirectResponse("/dashboard?discovery=running", status_code=303)
+        await client.set(status_key, "Search is running.", ex=600)
+    except RedisError:
+        logger.exception("Could not acquire manual discovery lock")
+        try:
+            await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                lock_key,
+                lock_token,
+            )
+        except RedisError:
+            logger.exception("Could not release manual discovery lock after startup failure")
+        return RedirectResponse("/dashboard?discovery=unavailable", status_code=303)
+    finally:
+        await client.aclose()
+
+    background_tasks.add_task(_run_manual_discovery, lock_token)
+    return RedirectResponse("/dashboard?discovery=started", status_code=303)
+
+
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-def dashboard(request: Request, state: str = "", session: Session = Depends(get_db)):
+async def dashboard(request: Request, state: str = "", discovery: str = "", session: Session = Depends(get_db)):
     redirect = _require_user(request)
     if redirect:
         return redirect
@@ -269,6 +342,32 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
         '<p class="muted">PRIVATE REVIEW WORKSPACE</p><h1>Applications</h1>'
         '<p class="lede">Review job evidence, match fit, and document versions before approving an application.</p>'
         '<p><a href="/follow-ups">View follow-up reminders and drafts</a></p>'
+        '<section class="card"><div class="toolbar"><div><h2>Job search</h2>'
+        '<p class="muted">Run one search across the sources configured in DISCOVERY_BOARDS.</p></div>'
+        '<form method="post" action="/discovery/run">'
+        + _csrf_input(request)
+        + '<button type="submit">Search jobs now</button></form></div>'
+    )
+    if discovery == "started":
+        body += '<p class="muted">Search started. Refresh this page in a moment for its result.</p>'
+    elif discovery == "running":
+        body += '<p class="muted">A job search is already running.</p>'
+    elif discovery == "unconfigured":
+        body += '<p class="muted">No discovery sources are configured. Set DISCOVERY_BOARDS first.</p>'
+    elif discovery == "unavailable":
+        body += '<p class="muted">Could not start search. Check Redis connectivity and application logs.</p>'
+    if discovery in {"started", "running"}:
+        status_client = Redis.from_url(get_settings().redis_url, decode_responses=True)
+        try:
+            status = await status_client.get("discovery:manual:status")
+            if status:
+                body += f'<p class="muted">{_e(status)}</p>'
+        except RedisError:
+            logger.exception("Could not read manual discovery status")
+        finally:
+            await status_client.aclose()
+    body += (
+        '</section>'
         '<section class="card"><div class="toolbar"><h2>Application queue</h2>'
         '<form method="get" action="/dashboard"><label class="muted" for="state">Filter by state</label> '
         '<select id="state" name="state"><option value="">All states</option>'
@@ -278,7 +377,7 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
         body += f'<option value="{_e(name)}"{selected}>{_e(name.replace("_", " ").title())}</option>'
     body += '</select> <button class="secondary" type="submit">Filter</button></form></div>'
     if not rows:
-        body += '<p class="muted">No applications match this filter. Jobs are added by the scheduled ARQ discovery worker, which must be running separately from this web service.</p>'
+        body += '<p class="muted">No applications match this filter. Use Search jobs now above to run discovery. Scheduled searches require the ARQ worker to be running separately from this web service.</p>'
     else:
         body += '<div class="table-wrap"><table><thead><tr><th>Role</th><th>State</th><th>Match</th><th>Verification</th><th>Documents</th><th>Actions</th></tr></thead><tbody>'
         for application, job in rows:
