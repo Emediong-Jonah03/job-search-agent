@@ -2,7 +2,7 @@
 
 ## Local access
 
-Set a unique `DASHBOARD_PASSWORD` in `.env`, keep `APP_SECRET_KEY` private, then start the API with Docker Compose. The dashboard is at `http://localhost:8000`. Compose binds the API to loopback. In production, use HTTPS at a trusted reverse proxy; secure cookies are enabled when `APP_ENV=production`. Production settings require a dashboard password of at least 24 characters and an application session secret of at least 32 characters.
+Set a unique `DASHBOARD_PASSWORD` in `.env`, keep `APP_SECRET_KEY` private, then start the API with Docker Compose. The dashboard is at `http://localhost:8000`. Compose binds the API to loopback. In production, use HTTPS at a trusted reverse proxy; secure cookies are enabled when `APP_ENV=production`. Production settings require a dashboard password of at least six characters with at least four distinct characters, and an application session secret of at least 32 characters. Six characters is a low security floor; use a much longer password for any internet-accessible deployment.
 
 ## Authentication and request protection
 

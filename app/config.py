@@ -65,12 +65,16 @@ class Settings(BaseSettings):
         if self.app_env == "production" and len(self.app_secret_key.get_secret_value()) < 32:
             raise ValueError("APP_SECRET_KEY must be at least 32 characters in production")
         if self.app_env == "production" and (
-            self.dashboard_password is None or len(self.dashboard_password.get_secret_value()) < 24
+            self.dashboard_password is None or len(self.dashboard_password.get_secret_value()) < 6
         ):
-            raise ValueError("DASHBOARD_PASSWORD must be at least 24 characters in production")
+            raise ValueError("DASHBOARD_PASSWORD must be at least 6 characters in production")
         if self.app_env == "production":
             dashboard_password = self.dashboard_password.get_secret_value()
-            if _is_placeholder(dashboard_password) or len(set(dashboard_password)) < 12:
+            if (
+                _is_placeholder(dashboard_password)
+                or dashboard_password.casefold() in {"123456", "password", "qwerty", "letmein"}
+                or len(set(dashboard_password)) < 4
+            ):
                 raise ValueError("DASHBOARD_PASSWORD must be a non-placeholder, high-entropy password in production")
             try:
                 database_password = make_url(self.database_url).password
