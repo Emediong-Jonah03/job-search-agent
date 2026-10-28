@@ -39,6 +39,14 @@ Compose requires the generated `POSTGRES_PASSWORD` and `REDIS_PASSWORD` values f
 
 For local Python setup, create a Python 3.12 virtual environment, then run `python -m pip install -e '.[dev]'`. Apply migrations with `alembic upgrade head`; run tests with `python -m pytest`.
 
+## CI/CD with GitHub Actions and Render
+
+The GitHub Actions workflow at `.github/workflows/ci.yml` runs for pull requests targeting `main` and for pushes to `main`. It installs the application and development dependencies, runs the test suite, and builds the production Docker image. It does not need production credentials, profile data, a live database, or API keys.
+
+Connect the GitHub repository to each Render application service (web/API and background worker), and set each service's branch to `main`. In each service's **Settings → Auto-Deploy**, select **After CI Checks Pass**. Render then deploys the commit only after the GitHub Actions check succeeds. Configure the Render PostgreSQL and Redis URLs, production secrets, and the `profile.yaml` Secret File independently in Render; add the profile Secret File to both services and set `PROFILE_PATH=/etc/secrets/profile.yaml`. Keep `.env` and `profile.local.yaml` out of Git.
+
+For schema-changing releases, set `alembic upgrade head` as the web service's pre-deploy command so the migration completes before the new web version goes live. Render's pre-deploy command requires a paid web service. Run migrations through an appropriate one-off/manual process if the service plan does not provide pre-deploy commands. The worker should not run migrations independently. See Render's docs for [deploying after CI checks pass](https://render.com/docs/deploys), [Docker services](https://render.com/docs/docker), and [secret files](https://render.com/docs/docker-secrets).
+
 ## HTTP API and dashboard endpoint reference
 
 The application exposes JSON health endpoints and an authenticated, server-rendered HTML dashboard. Application workflow routes use HTML forms and redirects; they are **not** a public JSON CRUD API. Unless a route is identified as a health check or static asset, it requires the dashboard session. All dashboard mutations require a CSRF token.
