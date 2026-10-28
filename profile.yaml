@@ -1,0 +1,35 @@
+# Populate this file with verified facts. It is the sole source for personal claims.
+full_name: ""
+contact:
+  email: ""
+  phone: ""
+location:
+  city: ""
+  region: ""
+  country: ""
+work_authorization:
+  countries: []
+  notes: ""
+work_preferences:
+  arrangements: [] # remote, hybrid, onsite
+  locations: []
+target_roles: []
+years_experience: null
+skills: []
+work_history: [] # employer, title, start_date, end_date, responsibilities
+projects: [] # name, description, technologies, results
+education: [] # institution, qualification, field, start_date, end_date
+certifications: [] # name, issuer, date
+links:
+  portfolio: ""
+  github: ""
+  linkedin: ""
+  other: []
+salary_expectations:
+  minimum: null
+  maximum: null
+  currency: ""
+employment_preferences:
+  preferences: []
+  deal_breakers: []
+
