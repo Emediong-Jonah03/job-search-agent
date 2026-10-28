@@ -51,6 +51,28 @@ class Application(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ApplicationDocument(Base):
+    __tablename__ = "application_documents"
+    __table_args__ = (
+        UniqueConstraint("application_id", "version", name="uq_application_document_version"),
+        Index("ix_application_documents_application_time", "application_id", "created_at"),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    cv_pdf_path: Mapped[str] = mapped_column(Text, nullable=False)
+    cv_docx_path: Mapped[str] = mapped_column(Text, nullable=False)
+    cover_letter_pdf_path: Mapped[str] = mapped_column(Text, nullable=False)
+    cover_letter_docx_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_hashes: Mapped[dict] = mapped_column(JSON, nullable=False)
+    profile_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_validation: Mapped[dict] = mapped_column(JSON, nullable=False)
+    job_analysis: Mapped[dict] = mapped_column(JSON, nullable=False)
+    llm_provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    llm_model: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ApplicationTransition(Base):
     __tablename__ = "application_transitions"
     __table_args__ = (Index("ix_transitions_application_time", "application_id", "occurred_at"),)

@@ -1,6 +1,6 @@
 # Job Application Agent
 
-Phases 1 and 2 establish a local foundation and public ATS job discovery workflow for an application system that uses verified profile facts and requires explicit human approval before submission. Employer verification, document generation, the review dashboard, and ATS submission are future phases.
+A local workflow assistant for finding and reviewing job opportunities, verifying posting evidence, and generating profile-backed application documents. Submission remains a later phase and requires explicit human approval.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ PostgreSQL is the durable record; Redis is the queue/cache layer. ARQ was select
 
 ## Project layout
 
-`app/domain` contains Pydantic workflow contracts and transition rules; `app/db` contains persistence models; `app/profile` loads the authoritative YAML profile; `app/audit` redacts audit payloads; `app/discovery` contains public ATS source adapters, freshness checks, URL normalization, and persistence; `app/matching` contains deterministic scoring; `app/workers` configures ARQ; `migrations` contains schema migrations; `tests` contains deterministic fixture tests. Later phases add verification, documents, approval, submission, tracking, and dashboard modules.
+`app/domain` contains Pydantic workflow contracts and transition rules; `app/db` contains persistence models; `app/profile` loads the authoritative YAML profile; `app/audit` redacts audit payloads; `app/discovery` contains public ATS source adapters, freshness checks, URL normalization, and persistence; `app/matching` contains deterministic scoring; `app/verification` assesses listing evidence; `app/llm` provides structured job-description extraction; `app/documents` builds, validates, renders, and privately stores application documents; `app/workers` configures ARQ; `migrations` contains schema migrations; `tests` contains deterministic fixture tests.
 
 ## Local setup
 
@@ -52,11 +52,18 @@ The verification score means the posting was supported by accessible ATS evidenc
 
 Official source documentation: [Greenhouse Job Board API](https://docs.greenhouse.io/job-board), [Lever public Postings API](https://github.com/lever/postings-api), [Ashby Job Postings API](https://developers.ashbyhq.com/docs/public-job-posting-api).
 
-## Phase 1 foundation
+## Document generation (Phase 4)
 
-Included: Docker services for FastAPI, PostgreSQL, Redis, and ARQ; environment-backed settings; foundational database entities and migration; Pydantic profile and workflow models; explicit state transition validation; redaction helper for audit payloads; liveness/readiness endpoints.
+The document service extracts structured job requirements and uses them only to rank profile facts. A deterministic claim check validates every personal statement against the profile before creating the four versioned files (CV and cover letter in PDF and DOCX). Artifacts are stored in the private Docker volume; they have no public download endpoint. The service transitions `SHORTLISTED` applications to `CV_GENERATED` after successful validation. It supports a deterministic mock provider and optional Claude, Gemini, or Groq JSON-schema providers. Provider setup, data handling, and limitations are in [docs/documents-and-claims.md](docs/documents-and-claims.md).
 
-Not yet included: authenticated review UI, LLM providers, document renderers, submission adapters, reminder scheduling, and production secrets/session management. No real job application is submitted by the system in these phases.
+The generation service has no authenticated user interface or download route yet. Applications are not submitted automatically; authenticated review and explicit approval are required before submission work is enabled.
+
+## Included phases
+
+- Phase 1: FastAPI, PostgreSQL, Redis, ARQ, profile contracts, state machine, audit helper, health checks.
+- Phase 2: Public Greenhouse, Lever, and Ashby discovery, freshness filtering, deduplication, and deterministic matching.
+- Phase 3: Posting evidence assessment and persisted verification records.
+- Phase 4: Structured job description analysis, exact profile-backed CV/cover-letter content, claim validation, PDF/DOCX rendering, private versioned storage, and audit records.
 
 ## Security and operations
 
