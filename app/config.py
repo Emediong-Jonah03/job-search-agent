@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     artifacts_path: str = "private-artifacts"
     log_level: str = "INFO"
     discovery_boards: str = ""
+    follow_up_days: int = Field(default=7, ge=1, le=90)
     verification_verified_threshold: int = Field(default=70, ge=1, le=100)
     verification_suspicious_risk_threshold: int = Field(default=40, ge=1, le=1000)
     llm_provider: Literal["mock", "claude", "gemini", "groq"] = "mock"

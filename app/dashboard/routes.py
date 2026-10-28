@@ -17,8 +17,9 @@ from app.approval.policy import approval_blockers, screening_answers_hash
 from app.approval.service import ApprovalDenied, approve_application, submit_for_approval
 from app.config import get_settings
 from app.db.models import (
-    Application, ApplicationApproval, ApplicationDocument, ApplicationTransition, AuditEvent,
-    Job, JobVerification, ScreeningQuestion, SubmissionAttempt, VerificationSignalRecord,
+    Application, ApplicationApproval, ApplicationDocument, ApplicationNote, ApplicationTransition,
+    AuditEvent, FollowUpReminder, Job, JobVerification, ScreeningQuestion, SubmissionAttempt,
+    VerificationSignalRecord,
 )
 from app.db.session import SessionLocal
 from app.documents.models import ApplicationDocumentContent
@@ -29,6 +30,7 @@ from app.profile.loader import ProfileLoadError, load_profile
 from app.submission.browser import HostedFormBrowser
 from app.submission.planning import SubmissionBlocked, build_submission_plan, resolve_plan_value
 from app.submission.models import SubmissionPlan
+from app.tracking.follow_ups import schedule_confirmed_submission
 
 
 router = APIRouter()
@@ -231,6 +233,7 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
     body = (
         '<p class="muted">PRIVATE REVIEW WORKSPACE</p><h1>Applications</h1>'
         '<p class="lede">Review job evidence, match fit, and document versions before approving an application.</p>'
+        '<p><a href="/follow-ups">View follow-up reminders and drafts</a></p>'
         '<section class="card"><div class="toolbar"><h2>Application queue</h2>'
         '<form method="get" action="/dashboard"><label class="muted" for="state">Filter by state</label> '
         '<select id="state" name="state"><option value="">All states</option>'
@@ -256,8 +259,36 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
                 '<td>' + _e(doc_label) + '</td><td><a href="/applications/' + _e(application.id) + '">Review</a></td></tr>'
             )
         body += '</tbody></table></div>'
-    body += '</section><p class="footer-note">Approval is per application. The dashboard does not submit applications.</p>'
+    body += '</section><p class="footer-note">Approval and submission confirmation are per application. Uncertain outcomes require manual reconciliation.</p>'
     return _layout(request, "Applications", body)
+
+
+@router.get("/follow-ups", response_class=HTMLResponse, include_in_schema=False)
+def follow_ups_page(request: Request, session: Session = Depends(get_db)):
+    redirect = _require_user(request)
+    if redirect:
+        return redirect
+    rows = session.execute(
+        select(FollowUpReminder, Application, Job)
+        .join(Application, Application.id == FollowUpReminder.application_id)
+        .join(Job, Job.id == Application.job_id)
+        .order_by(FollowUpReminder.scheduled_for.desc())
+    ).all()
+    body = '<p><a href="/dashboard">← Applications</a></p><h1>Follow-up reminders</h1>'
+    body += '<p class="lede">Reminders are created after confirmed submissions. Drafts require your review and are never sent by this dashboard.</p>'
+    if rows:
+        body += '<section class="card"><div class="table-wrap"><table><thead><tr><th>Role</th><th>State</th><th>Follow-up date (UTC)</th><th>Status</th><th></th></tr></thead><tbody>'
+        for reminder, application, job in rows:
+            body += (
+                f'<tr><td><strong>{_e(job.title)}</strong><br>{_e(job.employer)}</td>'
+                f'<td>{_e(application.state.replace("_", " "))}</td><td>{_e(reminder.scheduled_for)}</td>'
+                f'<td>{_e(reminder.status.replace("_", " "))}</td>'
+                f'<td><a href="/applications/{application.id}">Open application</a></td></tr>'
+            )
+        body += '</tbody></table></div></section>'
+    else:
+        body += '<section class="card"><p>No follow-up reminders yet. The system creates them after a confirmed submission.</p></section>'
+    return _layout(request, "Follow-up reminders", body)
 
 
 @router.get("/applications/{application_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -281,6 +312,10 @@ def application_detail(application_id: UUID, request: Request, session: Session 
     submission_attempts = list(session.scalars(select(SubmissionAttempt).where(
         SubmissionAttempt.application_id == application.id
     ).order_by(SubmissionAttempt.started_at.desc())))
+    reminder = session.scalar(select(FollowUpReminder).where(FollowUpReminder.application_id == application.id))
+    notes = list(session.scalars(select(ApplicationNote).where(
+        ApplicationNote.application_id == application.id
+    ).order_by(ApplicationNote.created_at.desc()).limit(100)))
     questions = list(session.scalars(select(ScreeningQuestion).where(
         ScreeningQuestion.application_id == application.id
     ).order_by(ScreeningQuestion.id)))
@@ -472,7 +507,27 @@ def application_detail(application_id: UUID, request: Request, session: Session 
         body += '</ul>'
     else:
         body += '<p class="muted">No submission attempts are recorded. Approved does not mean submitted.</p>'
-    body += '<p class="muted">Follow-up reminders are planned for Phase 7 and are not scheduled yet.</p></section>'
+    if reminder:
+        body += f'<h3>Follow-up reminder</h3><p><span class="badge">{_e(reminder.status.replace("_", " "))}</span> · scheduled {_e(reminder.scheduled_for)} UTC</p>'
+        if reminder.draft_text and reminder.status == "DRAFTED":
+            body += f'<form method="post" action="/applications/{application.id}/follow-ups/{reminder.id}/save-draft">{csrf}<label for="draft">Follow-up message draft</label><textarea id="draft" name="draft_text" maxlength="5000" required>{_e(reminder.draft_text)}</textarea><button class="secondary" type="submit">Save draft edits</button></form>'
+            body += f'<form method="post" action="/applications/{application.id}/follow-ups/{reminder.id}/approve">{csrf}<label for="approved-draft">Message to approve</label><textarea id="approved-draft" name="draft_text" maxlength="5000" required>{_e(reminder.draft_text)}</textarea><label><input type="checkbox" name="confirm" value="yes" required> I reviewed and approve this message for manual use.</label><p><button type="submit">Approve follow-up draft</button></p></form>'
+        elif reminder.status == "APPROVED":
+            body += f'<div class="callout">{_e(reminder.draft_text or "")}</div><p class="muted">The draft is approved for you to send manually. This dashboard does not send messages.</p>'
+            body += f'<form method="post" action="/applications/{application.id}/follow-ups/{reminder.id}/complete">{csrf}<label for="completion-note">Optional note</label><input id="completion-note" name="completion_note" maxlength="1000"><label><input type="checkbox" name="confirm" value="yes" required> I sent or handled this follow-up outside the dashboard.</label><p><button type="submit">Mark follow-up handled</button></p></form>'
+        elif reminder.status == "COMPLETED":
+            body += f'<p>Handled {_e(reminder.completed_at)} · {_e(reminder.completion_note or "No note")}</p>'
+        elif reminder.status == "SCHEDULED":
+            body += '<p class="muted">A draft will appear here when the reminder is due. The worker checks due reminders daily.</p>'
+    else:
+        body += '<p class="muted">A reminder is created only after a submission is confirmed.</p>'
+    body += '</section>'
+    body += '<section class="card"><h2>Application notes</h2>'
+    if notes:
+        body += '<ul>' + ''.join(f'<li>{_e(note.created_at)} · {_e(note.body)}</li>' for note in notes) + '</ul>'
+    else:
+        body += '<p class="muted">No notes have been added.</p>'
+    body += f'<form method="post" action="/applications/{application.id}/notes">{csrf}<label for="note">Add a private note</label><textarea id="note" name="body" maxlength="5000" required></textarea><button type="submit">Save note</button></form></section>'
     body += '<section class="card"><h2>State history</h2>'
     if transitions:
         body += '<ol>'
@@ -754,6 +809,8 @@ async def submit_application(application_id: UUID, request: Request, session: Se
             application.version += 1
             session.add(ApplicationTransition(application_id=application.id, previous_state=change.previous.value, new_state=change.new.value, actor="dashboard-user", reason=change.reason, metadata_json={"attempt_id": str(attempt.id)}))
             session.add(AuditEvent(event_type="application.submission.confirmed", actor="dashboard-user", application_id=application.id, payload={"attempt_id": str(attempt.id), "confirmation_number": result.confirmation_number}))
+            session.flush()
+            schedule_confirmed_submission(session, application.id, attempt.finished_at)
         elif result.status == "CONFIRMED_FAILURE" and not result.submission_clicked:
             application.submission_lock = False
         else:
@@ -795,6 +852,9 @@ async def reconcile_submission(application_id: UUID, request: Request, session: 
         attempt.result_metadata = {**(attempt.result_metadata or {}), "reconciliation_reference": ref, "reconciled_by": "dashboard-user"}
         application.submission_lock = False
         session.add(AuditEvent(event_type=event_type, actor="dashboard-user", application_id=application_id, payload={"attempt_id": str(attempt_id)}))
+        if data["resolution"][0] == "submitted":
+            session.flush()
+            schedule_confirmed_submission(session, application_id, attempt.finished_at)
     return RedirectResponse(f"/applications/{application_id}", status_code=303)
 
 
@@ -812,3 +872,90 @@ def submission_evidence(application_id: UUID, attempt_id: UUID, request: Request
     if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(status_code=404, detail="Submission evidence not found")
     return FileResponse(path, media_type="image/png", filename="submission-evidence.png", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/applications/{application_id}/notes", include_in_schema=False)
+async def add_application_note(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    body = data.get("body", [""])[0].strip()
+    if not body or len(body) > 5000:
+        raise HTTPException(status_code=422, detail="A note is required and must be at most 5,000 characters")
+    with session.begin():
+        application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        if application is None:
+            raise HTTPException(status_code=404, detail="Application not found")
+        note = ApplicationNote(application_id=application_id, body=body, author="dashboard-user")
+        session.add(note)
+        session.flush()
+        session.add(AuditEvent(event_type="application.note.created", actor="dashboard-user", application_id=application_id, payload={"note_id": str(note.id)}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/follow-ups/{reminder_id}/save-draft", include_in_schema=False)
+async def save_follow_up_draft(application_id: UUID, reminder_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    draft_text = data.get("draft_text", [""])[0].strip()
+    if not draft_text or len(draft_text) > 5000:
+        raise HTTPException(status_code=422, detail="Draft must contain 1 to 5,000 characters")
+    with session.begin():
+        reminder = session.scalar(select(FollowUpReminder).where(FollowUpReminder.id == reminder_id, FollowUpReminder.application_id == application_id).with_for_update())
+        if not reminder or reminder.status != "DRAFTED":
+            raise HTTPException(status_code=409, detail="Only a draft awaiting review can be edited")
+        reminder.draft_text = draft_text
+        session.add(AuditEvent(event_type="application.follow_up.draft_edited", actor="dashboard-user", application_id=application_id, payload={"reminder_id": str(reminder_id)}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/follow-ups/{reminder_id}/approve", include_in_schema=False)
+async def approve_follow_up_draft(application_id: UUID, reminder_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm") != ["yes"]:
+        raise HTTPException(status_code=422, detail="Explicit draft approval is required")
+    draft_text = data.get("draft_text", [""])[0].strip()
+    if not draft_text or len(draft_text) > 5000:
+        raise HTTPException(status_code=422, detail="Draft must contain 1 to 5,000 characters")
+    with session.begin():
+        reminder = session.scalar(select(FollowUpReminder).where(FollowUpReminder.id == reminder_id, FollowUpReminder.application_id == application_id).with_for_update())
+        if not reminder or reminder.status != "DRAFTED":
+            raise HTTPException(status_code=409, detail="This draft is no longer awaiting approval")
+        reminder.draft_text = draft_text
+        reminder.approved_at = datetime.now(timezone.utc)
+        reminder.status = "APPROVED"
+        session.add(AuditEvent(event_type="application.follow_up.draft_approved", actor="dashboard-user", application_id=application_id, payload={"reminder_id": str(reminder_id)}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/follow-ups/{reminder_id}/complete", include_in_schema=False)
+async def complete_follow_up(application_id: UUID, reminder_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm") != ["yes"]:
+        raise HTTPException(status_code=422, detail="Confirm that you handled the follow-up outside the dashboard")
+    completion_note = data.get("completion_note", [""])[0].strip()[:1000]
+    with session.begin():
+        application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        reminder = session.scalar(select(FollowUpReminder).where(FollowUpReminder.id == reminder_id, FollowUpReminder.application_id == application_id).with_for_update())
+        if not application or not reminder or reminder.status != "APPROVED":
+            raise HTTPException(status_code=409, detail="Only an approved draft can be marked handled")
+        now = datetime.now(timezone.utc)
+        reminder.status = "COMPLETED"
+        reminder.completed_at = now
+        reminder.completion_note = completion_note or None
+        if application.state == ApplicationState.SUBMITTED.value:
+            change = transition(ApplicationState.SUBMITTED, ApplicationState.FOLLOW_UP, "dashboard-user", "Follow-up handled manually")
+            application.state = change.new.value
+            application.version += 1
+            session.add(ApplicationTransition(application_id=application_id, previous_state=change.previous.value, new_state=change.new.value, actor="dashboard-user", reason=change.reason, metadata_json={"reminder_id": str(reminder_id)}))
+        session.add(AuditEvent(event_type="application.follow_up.completed", actor="dashboard-user", application_id=application_id, payload={"reminder_id": str(reminder_id)}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)

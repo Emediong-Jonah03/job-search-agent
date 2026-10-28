@@ -74,6 +74,12 @@ Greenhouse's application API requires an employer-specific API key, and Lever's 
 
 The automated test suite uses synthetic form snapshots and does not submit real applications. Browser integration requires a running Docker stack and a user-triggered dashboard submission; do not use a live job application as a test fixture.
 
+## Application tracking and follow-ups (Phase 7)
+
+Every confirmed submission gets one idempotent follow-up reminder, defaulting to seven days after the confirmed timestamp. Change `FOLLOW_UP_DAYS` in `.env` to a value from 1 to 90; the worker checks the reminder queue at 08:00 UTC and creates a saved, editable draft when a reminder is due. The draft uses only the employer, role, confirmed submission date, and profile name, and requires your approval. The dashboard does not send email or calendar messages. After sending or handling the message yourself, mark it handled in the application record. Application notes and the event history stay in the authenticated dashboard.
+
+After Phase 7 changes, rebuild and migrate with `docker compose up -d --build` and `docker compose exec api alembic upgrade head`. See [docs/tracking-and-hardening.md](docs/tracking-and-hardening.md) for status behavior, recovery, privacy, and deployment limitations.
+
 ## Included phases
 
 - Phase 1: FastAPI, PostgreSQL, Redis, ARQ, profile contracts, state machine, audit helper, health checks.
@@ -82,6 +88,7 @@ The automated test suite uses synthetic form snapshots and does not submit real 
 - Phase 4: Structured job description analysis, exact profile-backed CV/cover-letter content, claim validation, PDF/DOCX rendering, private versioned storage, and audit records.
 - Phase 5: Authenticated dashboard, job/evidence review, document preview/editing, screening review, disclosure summary, and explicit approval gate.
 - Phase 6: Allowlisted Greenhouse and Lever hosted-form inspection, exact-field preview and explicit submission, durable attempt locking, confirmation evidence, and manual reconciliation for uncertain outcomes.
+- Phase 7: Durable application notes and follow-up history, configurable idempotent reminders, worker-generated editable drafts, explicit draft approval, and manual completion tracking.
 
 ## Security and operations
 

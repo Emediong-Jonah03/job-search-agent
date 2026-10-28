@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -141,6 +141,43 @@ class SubmissionAttempt(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class FollowUpReminder(Base):
+    __tablename__ = "follow_up_reminders"
+    __table_args__ = (
+        UniqueConstraint("application_id", name="uq_follow_up_application"),
+        Index("ix_follow_up_status_due", "status", "scheduled_for"),
+        CheckConstraint("status IN ('SCHEDULED','DRAFTED','APPROVED','COMPLETED','CANCELLED')", name="ck_follow_up_status"),
+        CheckConstraint("status NOT IN ('DRAFTED','APPROVED','COMPLETED') OR draft_text IS NOT NULL", name="ck_follow_up_draft_required"),
+        CheckConstraint("status != 'APPROVED' OR approved_at IS NOT NULL", name="ck_follow_up_approved_at"),
+        CheckConstraint("status != 'COMPLETED' OR completed_at IS NOT NULL", name="ck_follow_up_completed_at"),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(ForeignKey("applications.id", ondelete="RESTRICT"), nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="SCHEDULED")
+    draft_text: Mapped[str | None] = mapped_column(Text)
+    drafted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completion_note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ApplicationNote(Base):
+    __tablename__ = "application_notes"
+    __table_args__ = (
+        Index("ix_application_notes_application_time", "application_id", "created_at"),
+        CheckConstraint("length(body) BETWEEN 1 AND 5000", name="ck_application_note_length"),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    author: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class JobVerification(Base):
