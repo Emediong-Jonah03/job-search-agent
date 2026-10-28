@@ -2,7 +2,7 @@ from functools import lru_cache
 
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,24 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     anthropic_api_version: str = "2023-06-01"
+    dashboard_password: SecretStr | None = None
+
+    @field_validator("dashboard_password", mode="before")
+    @classmethod
+    def blank_dashboard_password_is_unconfigured(cls, value: str | SecretStr | None) -> str | SecretStr | None:
+        if value is None or not str(value).strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def production_dashboard_auth(self) -> "Settings":
+        if self.app_env == "production" and len(self.app_secret_key.get_secret_value()) < 32:
+            raise ValueError("APP_SECRET_KEY must be at least 32 characters in production")
+        if self.app_env == "production" and (
+            self.dashboard_password is None or len(self.dashboard_password.get_secret_value()) < 24
+        ):
+            raise ValueError("DASHBOARD_PASSWORD must be at least 24 characters in production")
+        return self
 
 
 @lru_cache

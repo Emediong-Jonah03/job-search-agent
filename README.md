@@ -1,6 +1,6 @@
 # Job Application Agent
 
-A local workflow assistant for finding and reviewing job opportunities, verifying posting evidence, and generating profile-backed application documents. Submission remains a later phase and requires explicit human approval.
+A local workflow assistant for finding and reviewing job opportunities, verifying posting evidence, generating profile-backed documents, and recording application-specific human approval. Submission remains a later phase.
 
 ## Architecture
 
@@ -54,9 +54,15 @@ Official source documentation: [Greenhouse Job Board API](https://docs.greenhous
 
 ## Document generation (Phase 4)
 
-The document service extracts structured job requirements and uses them only to rank profile facts. A deterministic claim check validates every personal statement against the profile before creating the four versioned files (CV and cover letter in PDF and DOCX). Artifacts are stored in the private Docker volume; they have no public download endpoint. The service transitions `SHORTLISTED` applications to `CV_GENERATED` after successful validation. It supports a deterministic mock provider and optional Claude, Gemini, or Groq JSON-schema providers. Provider setup, data handling, and limitations are in [docs/documents-and-claims.md](docs/documents-and-claims.md).
+The document service extracts structured job requirements and uses them only to rank profile facts. A deterministic claim check validates every personal statement against the profile before creating the four versioned files (CV and cover letter in PDF and DOCX). Artifacts are stored in the private Docker volume; they have no public file API. The service transitions `SHORTLISTED` applications to `CV_GENERATED` after successful validation. It supports a deterministic mock provider and optional Claude, Gemini, or Groq structured-output providers. Provider setup, data handling, and limitations are in [docs/documents-and-claims.md](docs/documents-and-claims.md).
 
-The generation service has no authenticated user interface or download route yet. Applications are not submitted automatically; authenticated review and explicit approval are required before submission work is enabled.
+## Approval dashboard (Phase 5)
+
+Open `http://localhost:8000` after setting `DASHBOARD_PASSWORD` in `.env`. The local dashboard uses signed, HTTP-only, same-site session cookies, CSRF tokens on every form mutation, and server-side authorization for document access. It shows job details, verification signals and uncertainty, match score, CV and cover-letter previews, private downloads, profile-data disclosure, screening-question review, state history, and per-application skip/review/approve actions. Editing the structured source creates a new validated version and clears any previous approval. Approval requires a passing claim check and all collected screening answers resolved; approval does not submit an application.
+
+The UI is server-rendered HTML with native forms and a small local stylesheet instead of React or HTMX. For this single-user local dashboard, this avoids a separate JavaScript build, external browser dependencies, and cross-origin API calls while keeping the review and approval boundary on the server. The API port binds to `127.0.0.1` in Compose. Set a unique password in `.env`; production configuration requires a 24-character dashboard password and 32-character session secret, and enables secure cookies. Configure TLS before exposing a production deployment through a reverse proxy.
+
+See [docs/approval-dashboard.md](docs/approval-dashboard.md) for authentication behavior, review flow, and security limitations.
 
 ## Included phases
 
@@ -64,6 +70,7 @@ The generation service has no authenticated user interface or download route yet
 - Phase 2: Public Greenhouse, Lever, and Ashby discovery, freshness filtering, deduplication, and deterministic matching.
 - Phase 3: Posting evidence assessment and persisted verification records.
 - Phase 4: Structured job description analysis, exact profile-backed CV/cover-letter content, claim validation, PDF/DOCX rendering, private versioned storage, and audit records.
+- Phase 5: Authenticated dashboard, job/evidence review, document preview/editing, screening review, disclosure summary, and explicit approval gate.
 
 ## Security and operations
 

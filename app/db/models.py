@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -47,6 +47,7 @@ class Application(Base):
     state: Mapped[str] = mapped_column(String(40), nullable=False, default="DISCOVERED")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     match_score: Mapped[int | None] = mapped_column(Integer)
+    match_details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -68,9 +69,24 @@ class ApplicationDocument(Base):
     profile_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_validation: Mapped[dict] = mapped_column(JSON, nullable=False)
     job_analysis: Mapped[dict] = mapped_column(JSON, nullable=False)
+    content_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     llm_provider: Mapped[str] = mapped_column(String(40), nullable=False)
     llm_model: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ScreeningQuestion(Base):
+    __tablename__ = "screening_questions"
+    __table_args__ = (Index("ix_screening_questions_application", "application_id", "status"),)
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_answer: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    answer: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    answer_profile_path: Mapped[str | None] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="UNRESOLVED")
+    reviewed_by: Mapped[str | None] = mapped_column(String(200))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ApplicationTransition(Base):
@@ -84,6 +100,23 @@ class ApplicationTransition(Base):
     reason: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, nullable=False, default=dict)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApplicationApproval(Base):
+    __tablename__ = "application_approvals"
+    __table_args__ = (
+        Index("ix_application_approvals_application_time", "application_id", "approved_at"),
+        Index("uq_active_application_approval", "application_id", unique=True, postgresql_where=text("invalidated_at IS NULL")),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), nullable=False)
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    verification_id: Mapped[UUID] = mapped_column(ForeignKey("job_verifications.id", ondelete="RESTRICT"), nullable=False)
+    answers_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidation_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditEvent(Base):

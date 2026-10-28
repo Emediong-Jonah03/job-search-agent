@@ -57,7 +57,10 @@ def persist_discovery(
         )
         session.add(source_row)
         if created:
-            application = Application(id=uuid4(), job_id=job_id, state="DISCOVERED", match_score=match.score)
+            application = Application(
+                id=uuid4(), job_id=job_id, state="DISCOVERED", match_score=match.score,
+                match_details=match.model_dump(mode="json"),
+            )
             session.add(application)
             session.flush()
             application_id = application.id

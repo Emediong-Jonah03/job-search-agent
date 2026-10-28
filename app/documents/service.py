@@ -95,6 +95,7 @@ async def generate_application_documents(
             profile_hash=_profile_fingerprint(profile),
             claim_validation=report.model_dump(mode="json"),
             job_analysis=result.analysis.model_dump(mode="json"),
+            content_json=content.model_dump(mode="json"),
             llm_provider=result.provider,
             llm_model=result.model,
         )
