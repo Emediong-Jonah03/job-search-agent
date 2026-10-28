@@ -40,7 +40,7 @@ def verify_job(
     """Persist a point-in-time assessment, signals, audit event, and any required state change."""
     with session.begin():
         job = session.scalar(select(Job).where(Job.id == job_id))
-        if job is None:
+        if job is None or job.deleted_at is not None:
             raise LookupError(f"Job {job_id} does not exist")
         source = session.scalar(
             select(JobSource)
@@ -156,7 +156,7 @@ def verify_unassessed_discovered_jobs(session_factory) -> int:
             select(Job.id)
             .join(Application, Application.job_id == Job.id)
             .outerjoin(JobVerification, JobVerification.job_id == Job.id)
-            .where(Application.state == ApplicationState.DISCOVERED.value, JobVerification.id.is_(None))
+            .where(Application.state == ApplicationState.DISCOVERED.value, JobVerification.id.is_(None), Job.deleted_at.is_(None))
             .distinct()
         ))
     for job_id in job_ids:

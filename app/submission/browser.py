@@ -16,16 +16,21 @@ class HostedFormBrowser:
         self.timeout_ms = timeout_ms
 
     async def inspect(self, job_url: str) -> FormSnapshot:
-        adapter, page_hosts, _ = adapter_for_url(job_url)
-        del adapter
+        _, page_hosts, action_hosts = adapter_for_url(job_url)
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
-            page = await browser.new_page()
-            await page.goto(job_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            await page.locator("body").wait_for()
-            result = await page.evaluate("""() => {
+            try:
+                context = await browser.new_context(service_workers="block")
+                page = await context.new_page()
+                await self._install_request_guard(page, page_hosts | action_hosts)
+                try:
+                    await page.goto(job_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                except Exception as exc:
+                    raise SubmissionBlocked("SAFE_NAVIGATION_BLOCKED", "The application page could not be loaded safely.") from exc
+                await page.locator("body").wait_for()
+                result = await page.evaluate("""() => {
               const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
               const forms = [...document.forms];
               const form = forms.length === 1 ? forms[0] : null;
@@ -40,8 +45,9 @@ class HostedFormBrowser:
                 submit_button_count: form ? form.querySelectorAll('button[type=submit],input[type=submit],button:not([type])').length : 0,
                 form_action: form?.action || '', form_method: form?.method || '', fields,
                 frame_urls: [...document.querySelectorAll('iframe')].map(f => f.src).slice(0,50) };
-            }""")
-            await browser.close()
+                }""")
+            finally:
+                await browser.close()
         snapshot = FormSnapshot.model_validate(result)
         if not _host_allowed(snapshot.current_url, page_hosts):
             raise SubmissionBlocked("OFFSITE_REDIRECT", "The application page redirected outside the supported ATS host.")
@@ -57,8 +63,10 @@ class HostedFormBrowser:
         screenshot = None
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
-            page = await browser.new_page()
             try:
+                context = await browser.new_context(service_workers="block")
+                page = await context.new_page()
+                await self._install_request_guard(page, page_hosts | action_hosts)
                 await page.goto(plan.job_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await page.locator("body").wait_for()
                 snap = await self._snapshot_current_page(page)
@@ -97,6 +105,7 @@ class HostedFormBrowser:
                 if not validity:
                     raise SubmissionBlocked("FORM_VALIDATION", "The form has validation errors. No submission was attempted.")
                 screenshot = await page.screenshot(full_page=True)
+                pre_submit_text = (await page.locator("body").inner_text())[:20000]
                 # Mark the attempt before invoking click: Playwright may time out after dispatching it.
                 clicked = True
                 await page.locator("form button[type=submit],form input[type=submit],form button:not([type])").click(timeout=self.timeout_ms)
@@ -108,7 +117,8 @@ class HostedFormBrowser:
                 text = (await page.locator("body").inner_text())[:20000]
                 screenshot = await page.screenshot(full_page=True)
                 confirmation = self._confirmation(plan.adapter, text)
-                if confirmation:
+                prior_confirmation = self._confirmation(plan.adapter, pre_submit_text)
+                if confirmation and not prior_confirmation:
                     number = ""
                     import re
                     match = re.search(r"(?:confirmation|application)\s*(?:number|id|#)\s*[:#-]?\s*([A-Z0-9-]{4,})", confirmation, re.I)
@@ -130,6 +140,16 @@ class HostedFormBrowser:
         if kind == "name":
             return page.locator(f'[name="{value}"]')
         raise SubmissionBlocked("UNLOCATABLE_FIELD", "A form field has no stable identifier; manual application is required.")
+
+    @staticmethod
+    async def _install_request_guard(page, allowed_hosts: set[str]) -> None:
+        async def guard(route):
+            if _host_allowed(route.request.url, allowed_hosts):
+                await route.continue_()
+            else:
+                await route.abort("blockedbyclient")
+
+        await page.route("**/*", guard)
 
     @staticmethod
     async def _snapshot_current_page(page) -> FormSnapshot:

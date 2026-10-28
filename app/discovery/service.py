@@ -54,8 +54,9 @@ async def check_live_link(job: DiscoveredJob) -> LinkCheck:
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=False) as client:
-            response = await client.get(url, headers={"User-Agent": "JobApplicationAgent/0.1 (public posting check)"})
-        return LinkCheck(url=url, accessible=200 <= response.status_code < 300, status_code=response.status_code, reason="Posting returned a successful HTTP status" if 200 <= response.status_code < 300 else "Posting is unavailable, redirecting, or rejected the request")
+            async with client.stream("GET", url, headers={"User-Agent": "JobApplicationAgent/0.1 (public posting check)"}) as response:
+                status_code = response.status_code
+        return LinkCheck(url=url, accessible=200 <= status_code < 300, status_code=status_code, reason="Posting returned a successful HTTP status" if 200 <= status_code < 300 else "Posting is unavailable, redirecting, or rejected the request")
     except httpx.HTTPError:
         return LinkCheck(url=url, accessible=False, reason="Posting request failed")
 

@@ -26,14 +26,16 @@ No reminder is created for `OUTCOME_UNKNOWN`, failed, or merely prepared submiss
 - Reminder and application note routes are scoped by both application and record IDs. Draft approval and completion use row locks and reject stale or already-processed records.
 - A database uniqueness constraint protects against duplicate reminders if the worker is retried or runs concurrently. The daily worker processes bounded batches and locks due rows with `SKIP LOCKED`.
 - Drafts are stored as private database records and require user approval. No external message is sent by the worker or dashboard.
-- The supplied Compose stack is for local development: API, PostgreSQL, and Redis bind to loopback, while the database and Redis use development credentials. Do not expose it to an untrusted network without replacing credentials, enabling TLS, restricting access, and setting production secrets.
+- The supplied Compose stack is for local development: API, PostgreSQL, and Redis bind to loopback. It requires distinct PostgreSQL and Redis passwords and enables Redis authentication. Keep the data-service ports off public interfaces in production, terminate TLS at a trusted proxy, and set that proxy's exact IPs in `FORWARDED_ALLOW_IPS`.
 - Back up PostgreSQL and the private artifact volume together. Restoring only one can separate confirmation history from the associated screenshots/documents.
 
 ## Local commands
 
 ```powershell
-docker compose up -d --build
-docker compose exec api alembic upgrade head
+docker compose stop api worker
+docker compose up -d db redis
+docker compose run --build --rm api alembic upgrade head
+docker compose up --build -d api worker
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```

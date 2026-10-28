@@ -1,15 +1,23 @@
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
+
+def _is_placeholder(value: str) -> bool:
+    lowered = value.casefold()
+    return any(marker in lowered for marker in ("replace-with", "replace-me", "change-me", "changeme", "placeholder", "your-secret"))
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    app_env: str = "development"
+    app_env: Literal["development", "test", "production"] = "development"
     app_secret_key: SecretStr
     database_url: str = "postgresql+psycopg://jobs:jobs@localhost:5432/jobs"
     redis_url: str = "redis://localhost:6379/0"
@@ -44,6 +52,14 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("app_secret_key")
+    @classmethod
+    def require_strong_session_secret(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value()
+        if len(secret) < 32 or len(set(secret)) < 16 or _is_placeholder(secret):
+            raise ValueError("APP_SECRET_KEY must be a generated, non-placeholder secret of at least 32 characters")
+        return value
+
     @model_validator(mode="after")
     def production_dashboard_auth(self) -> "Settings":
         if self.app_env == "production" and len(self.app_secret_key.get_secret_value()) < 32:
@@ -52,6 +68,25 @@ class Settings(BaseSettings):
             self.dashboard_password is None or len(self.dashboard_password.get_secret_value()) < 24
         ):
             raise ValueError("DASHBOARD_PASSWORD must be at least 24 characters in production")
+        if self.app_env == "production":
+            dashboard_password = self.dashboard_password.get_secret_value()
+            if _is_placeholder(dashboard_password) or len(set(dashboard_password)) < 12:
+                raise ValueError("DASHBOARD_PASSWORD must be a non-placeholder, high-entropy password in production")
+            try:
+                database_password = make_url(self.database_url).password
+                redis_password = urlsplit(self.redis_url).password
+            except (ValueError, ArgumentError) as exc:
+                raise ValueError("DATABASE_URL and REDIS_URL must be valid production connection URLs") from exc
+            if (
+                not database_password or len(database_password) < 24
+                or _is_placeholder(database_password) or database_password.casefold() in {"jobs", "password", "postgres"}
+            ):
+                raise ValueError("DATABASE_URL must use a unique, non-placeholder password of at least 24 characters in production")
+            if (
+                not redis_password or len(redis_password) < 24
+                or _is_placeholder(redis_password) or redis_password.casefold() in {"jobs", "password", "redis"}
+            ):
+                raise ValueError("REDIS_URL must include a unique, non-placeholder password of at least 24 characters in production")
         return self
 
 

@@ -49,6 +49,10 @@ def persist_discovery(
         if job_id is None:  # Defensive: concurrent delete or DB inconsistency.
             raise RuntimeError("Job insert conflicted but the canonical job could not be loaded")
 
+        existing_job = session.get(Job, job_id)
+        if not created and existing_job is not None and existing_job.deleted_at is not None:
+            return str(job_id), False
+
         source_row = JobSource(
             job_id=job_id,
             adapter=job.source_name,

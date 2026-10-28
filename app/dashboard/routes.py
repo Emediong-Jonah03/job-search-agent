@@ -1,8 +1,7 @@
 import html
-import json
 import hashlib
+import json
 import secrets
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -10,6 +9,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -34,7 +35,6 @@ from app.tracking.follow_ups import schedule_confirmed_submission
 
 
 router = APIRouter()
-LOGIN_FAILURES: dict[str, list[float]] = {}
 STATE_NAMES = [item.value for item in ApplicationState]
 DOCUMENT_PATHS = {
     "cv-pdf": ("cv_pdf_path", "application/pdf", True),
@@ -69,11 +69,45 @@ def _check_csrf(request: Request, data: dict[str, list[str]]) -> None:
 
 
 async def _form(request: Request) -> dict[str, list[str]]:
-    body = await request.body()
-    if len(body) > 1_048_576:
-        raise HTTPException(status_code=413, detail="Form is too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 1_048_576:
+            raise HTTPException(status_code=413, detail="Form is too large")
+        body.extend(chunk)
     raw = body.decode("utf-8", errors="replace")
-    return parse_qs(raw, keep_blank_values=True, max_num_fields=100)
+    try:
+        return parse_qs(raw, keep_blank_values=True, max_num_fields=100)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Form has too many fields") from exc
+
+
+def _login_rate_key(request: Request) -> str:
+    remote = request.client.host if request.client else "unknown"
+    return "login-failures:" + hashlib.sha256(remote.encode("utf-8")).hexdigest()
+
+
+async def _consume_login_attempt(request: Request) -> int:
+    client = Redis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        async with client.pipeline(transaction=True) as pipeline:
+            pipeline.incr(_login_rate_key(request))
+            pipeline.expire(_login_rate_key(request), 600, nx=True)
+            result = await pipeline.execute()
+        return int(result[0])
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable") from exc
+    finally:
+        await client.aclose()
+
+
+async def _clear_login_attempts(request: Request) -> None:
+    client = Redis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        await client.delete(_login_rate_key(request))
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable") from exc
+    finally:
+        await client.aclose()
 
 
 def _is_authenticated(request: Request) -> bool:
@@ -192,18 +226,14 @@ async def login(request: Request):
     supplied = data.get("csrf_token", [""])[0]
     if not expected or not secrets.compare_digest(expected, supplied):
         raise HTTPException(status_code=403, detail="Invalid or expired sign-in form. Reload and try again.")
-    remote = request.client.host if request.client else "unknown"
-    recent = [stamp for stamp in LOGIN_FAILURES.get(remote, []) if stamp > time.monotonic() - 600]
-    LOGIN_FAILURES[remote] = recent
-    if len(recent) >= 8:
+    if await _consume_login_attempt(request) > 8:
         raise HTTPException(status_code=429, detail="Too many sign-in attempts. Try again in ten minutes.")
     password = data.get("password", [""])[0]
     if not secrets.compare_digest(password, settings.dashboard_password.get_secret_value()):
-        LOGIN_FAILURES[remote] = recent + [time.monotonic()]
         body = '<section class="card login"><h1>Sign in failed</h1><p>The password was not accepted.</p><a class="button" href="/login">Try again</a></section>'
         page = _layout(request, "Sign in failed", body, authenticated=False)
         return HTMLResponse(page.body, status_code=401, headers={"Cache-Control": "no-store"})
-    LOGIN_FAILURES.pop(remote, None)
+    await _clear_login_attempts(request)
     request.session.clear()
     request.session.update({"authenticated": True, "actor": "dashboard-user", "csrf": secrets.token_urlsafe(32)})
     return RedirectResponse("/dashboard", status_code=303)
@@ -226,7 +256,7 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
         return redirect
     if state and state not in STATE_NAMES:
         raise HTTPException(status_code=422, detail="Unknown application state filter")
-    query = select(Application, Job).join(Job, Job.id == Application.job_id).order_by(Application.updated_at.desc())
+    query = select(Application, Job).join(Job, Job.id == Application.job_id).where(Job.deleted_at.is_(None)).order_by(Application.updated_at.desc())
     if state:
         query = query.where(Application.state == state)
     rows = session.execute(query).all()
@@ -245,18 +275,31 @@ def dashboard(request: Request, state: str = "", session: Session = Depends(get_
     if not rows:
         body += '<p class="muted">No applications match this filter yet. Job discovery runs from configured boards.</p>'
     else:
-        body += '<div class="table-wrap"><table><thead><tr><th>Role</th><th>State</th><th>Match</th><th>Verification</th><th>Documents</th><th></th></tr></thead><tbody>'
+        body += '<div class="table-wrap"><table><thead><tr><th>Role</th><th>State</th><th>Match</th><th>Verification</th><th>Documents</th><th>Actions</th></tr></thead><tbody>'
         for application, job in rows:
             verification = _latest_verification(session, job.id)
             document = _latest_document(session, application.id)
             verified = verification.classification if verification else "NOT ASSESSED"
             doc_label = f"v{document.version}" if document else "Not generated"
+            actions = f'<a href="/applications/{application.id}">Review</a>'
+            if application.state in {
+                ApplicationState.DISCOVERED.value,
+                ApplicationState.VERIFIED.value,
+                ApplicationState.REJECTED_BY_VERIFICATION.value,
+                ApplicationState.SKIPPED.value,
+            }:
+                actions += (
+                    f'<form method="post" action="/applications/{application.id}/delete">'
+                    + _csrf_input(request)
+                    + '<label><input type="checkbox" name="confirm_delete" value="yes" required> Hide and keep history</label>'
+                    + '<button class="danger" type="submit">Delete</button></form>'
+                )
             body += (
                 '<tr><td><strong>' + _e(job.title) + '</strong><br><span class="muted">' + _e(job.employer) + '</span></td>'
                 '<td><span class="badge">' + _e(application.state.replace("_", " ")) + '</span></td>'
                 '<td>' + (_e(f"{application.match_score}/100") if application.match_score is not None else "Not scored") + '</td>'
                 '<td><span class="badge ' + ("good" if verified == "VERIFIED" else "warn" if verified == "PROBABLE" else "bad" if verified == "SUSPICIOUS" else "") + '">' + _e(verified) + '</span></td>'
-                '<td>' + _e(doc_label) + '</td><td><a href="/applications/' + _e(application.id) + '">Review</a></td></tr>'
+                '<td>' + _e(doc_label) + '</td><td><div class="actions">' + actions + '</div></td></tr>'
             )
         body += '</tbody></table></div>'
     body += '</section><p class="footer-note">Approval and submission confirmation are per application. Uncertain outcomes require manual reconciliation.</p>'
@@ -300,6 +343,8 @@ def application_detail(application_id: UUID, request: Request, session: Session 
     if application is None:
         raise HTTPException(status_code=404, detail="Application not found")
     job = session.get(Job, application.job_id)
+    if job is None or job.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Application not found")
     job_source = session.scalar(
         select(JobSource).where(JobSource.job_id == job.id).order_by(JobSource.observed_at.desc()).limit(1)
     )
@@ -724,6 +769,57 @@ async def skip(application_id: UUID, request: Request, session: Session = Depend
     return RedirectResponse("/dashboard", status_code=303)
 
 
+@router.post("/applications/{application_id}/delete", include_in_schema=False)
+async def delete_unused_application(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm_delete", [""])[0] != "yes":
+        raise HTTPException(status_code=422, detail="Confirm that you want to hide this listing")
+
+    deletable_states = {
+        ApplicationState.DISCOVERED.value,
+        ApplicationState.VERIFIED.value,
+        ApplicationState.REJECTED_BY_VERIFICATION.value,
+        ApplicationState.SKIPPED.value,
+    }
+    with session.begin():
+        application = session.scalar(
+            select(Application).where(Application.id == application_id).with_for_update()
+        )
+        if application is None:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if application.state not in deletable_states or application.submission_lock:
+            raise HTTPException(status_code=409, detail="Only unused listings without generated application documents or submission activity can be hidden")
+
+        protected_records = (
+            (ApplicationDocument, ApplicationDocument.application_id),
+            (ApplicationApproval, ApplicationApproval.application_id),
+            (SubmissionAttempt, SubmissionAttempt.application_id),
+            (FollowUpReminder, FollowUpReminder.application_id),
+            (ScreeningQuestion, ScreeningQuestion.application_id),
+            (ApplicationNote, ApplicationNote.application_id),
+        )
+        if any(
+            session.scalar(select(model.id).where(column == application_id).limit(1)) is not None
+            for model, column in protected_records
+        ):
+            raise HTTPException(status_code=409, detail="This application has saved review or submission history and cannot be hidden")
+
+        job = session.scalar(select(Job).where(Job.id == application.job_id).with_for_update())
+        if job is None:
+            raise HTTPException(status_code=409, detail="The associated job listing is missing")
+        job.deleted_at = datetime.now(timezone.utc)
+        session.add(AuditEvent(
+            event_type="job.deleted",
+            actor="dashboard-user",
+            application_id=application.id,
+            payload={"job_id": str(job.id), "employer": job.employer, "title": job.title},
+        ))
+    return RedirectResponse("/dashboard", status_code=303)
+
+
 @router.post("/applications/{application_id}/prepare-submission", include_in_schema=False)
 async def prepare_submission(application_id: UUID, request: Request, session: Session = Depends(get_db)):
     if not _is_authenticated(request):
@@ -788,7 +884,16 @@ async def submit_application(application_id: UUID, request: Request, session: Se
         answers_hash = screening_answers_hash([{"question_id": str(q.id), "status": q.status, "answer": q.answer, "profile_path": q.answer_profile_path} for q in questions])
         profile = _profile()
         profile_hash = hashlib.sha256(json.dumps(profile.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        if not approval or approval.invalidated_at or not doc or not verification or verification.classification != "VERIFIED" or str(verification.id) != plan.verification_id or doc.version != plan.document_version or approval.answers_hash != answers_hash or plan.answers_hash != answers_hash or plan.profile_hash != profile_hash or doc.profile_hash != profile_hash:
+        if (
+            not approval or approval.application_id != application.id
+            or str(approval.id) != plan.approval_id or approval.invalidated_at
+            or plan.application_id != str(application.id) or plan.job_url != job.canonical_url
+            or approval.document_version != plan.document_version
+            or not doc or not verification or verification.classification != "VERIFIED"
+            or str(verification.id) != plan.verification_id or doc.version != plan.document_version
+            or approval.answers_hash != answers_hash or plan.answers_hash != answers_hash
+            or plan.profile_hash != profile_hash or doc.profile_hash != profile_hash
+        ):
             raise HTTPException(status_code=409, detail="Reviewed data changed. Prepare the form again after reviewing the application.")
         attempt.status = "IN_PROGRESS"
         attempt.result_metadata = {**attempt.result_metadata, "stage": "SUBMITTING", "submission_clicked": False}

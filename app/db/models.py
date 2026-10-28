@@ -13,6 +13,7 @@ class Job(Base):
     __table_args__ = (
         UniqueConstraint("canonical_url", "employer_key", "title_key", name="uq_job_identity"),
         Index("ix_jobs_posted_at", "posted_at"),
+        Index("ix_jobs_deleted_at", "deleted_at"),
     )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -24,6 +25,7 @@ class Job(Base):
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     sources: Mapped[list["JobSource"]] = relationship(back_populates="job", cascade="all, delete-orphan")
 

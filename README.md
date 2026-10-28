@@ -11,7 +11,7 @@ flowchart LR
   API --> R[(Redis)]
   R --> W[ARQ worker]
   W --> PG
-  API --> P[profile.yaml]
+  API --> P[profile.local.yaml]
   API --> A[private artifact volume]
 ```
 
@@ -25,14 +25,17 @@ PostgreSQL is the durable record; Redis is the queue/cache layer. ARQ was select
 
 Requirements: Docker Desktop with Compose. Python 3.12 is needed for running tests outside Docker.
 
-1. Copy `.env.example` to `.env` and replace `APP_SECRET_KEY` with a long random value.
-2. Populate `profile.yaml` with verified facts. Keep personal profile files out of source control when practical.
-3. Start services: `docker compose up --build -d`
-4. Apply schema: `docker compose exec api alembic upgrade head`
-5. Check API liveness: `http://localhost:8000/health/live`; readiness: `http://localhost:8000/health/ready`.
-6. Stop services: `docker compose down`.
+1. Copy `.env.example` to `.env`. Generate `APP_SECRET_KEY`, `POSTGRES_PASSWORD`, and `REDIS_PASSWORD` with `python -c "import secrets; print(secrets.token_urlsafe(48))"`; use a distinct generated value for each. Set a unique `DASHBOARD_PASSWORD`.
+2. Copy the tracked, blank `profile.example.yaml` to the ignored `profile.local.yaml` and populate that local copy with verified facts. Docker Compose mounts the local file into the containers. For direct Python runs, set `PROFILE_PATH=profile.local.yaml`.
+3. Start only the data services: `docker compose up -d db redis`.
+4. Apply schema migrations before starting the worker: `docker compose run --build --rm api alembic upgrade head`.
+5. Start the API and worker: `docker compose up --build -d api worker`.
+6. Check API liveness: `http://localhost:8000/health/live`; readiness: `http://localhost:8000/health/ready`.
+7. Stop services: `docker compose down`.
 
 Database and Redis data persist in Compose volumes. To reset a development database and queue, `docker compose down -v` removes those named volumes and their data.
+
+Compose requires the generated `POSTGRES_PASSWORD` and `REDIS_PASSWORD` values from `.env`; it builds the container connection URLs from them and requires Redis authentication. PostgreSQL and Redis development ports bind to `127.0.0.1`; keep them off public interfaces in production. Production startup rejects placeholder session/database/Redis credentials and unknown `APP_ENV` values. If using a reverse proxy, set `FORWARDED_ALLOW_IPS` to the proxy's exact IP addresses; do not trust arbitrary forwarded headers.
 
 For local Python setup, create a Python 3.12 virtual environment, then run `python -m pip install -e '.[dev]'`. Apply migrations with `alembic upgrade head`; run tests with `python -m pytest`.
 
@@ -75,6 +78,9 @@ curl.exe -i http://localhost:8000/health/ready
 | `GET /dashboard` | Optional query: `state` | Applications queue HTML. `state` must be one of `DISCOVERED`, `VERIFIED`, `SHORTLISTED`, `CV_GENERATED`, `AWAITING_APPROVAL`, `APPROVED`, `SUBMITTED`, `FOLLOW_UP`, `REJECTED_BY_VERIFICATION`, or `SKIPPED`; unknown values return `422`. |
 | `GET /follow-ups` | No body | Follow-up reminder list HTML, including status and scheduled timestamp in UTC. |
 | `GET /applications/{application_id}` | UUID path parameter | Application detail HTML: job and verification evidence, match details, document versions, screening questions, approval/submission status, notes, reminders, and state history. |
+| `POST /applications/{application_id}/delete` | Authenticated form: `csrf_token`, checked `confirm_delete=yes` | Hides an unused job from the dashboard and future discovery while retaining its history, records a `job.deleted` audit event, and redirects to `/dashboard` (`303`). Offered for discovered, verified, rejected, and skipped listings; shortlisted jobs and records with saved review/submission activity cannot be hidden (`409`). |
+
+Use **Delete** in the dashboard row to hide a listing you no longer want. Check **Hide and keep history** to confirm. Hidden listings remain in the database as deduplication tombstones, so scheduled discovery does not recreate them; application, verification, source, and audit history are retained.
 
 ### Application documents and screening review
 
@@ -164,7 +170,7 @@ The automated test suite uses synthetic form snapshots and does not submit real 
 
 Every confirmed submission gets one idempotent follow-up reminder, defaulting to seven days after the confirmed timestamp. Change `FOLLOW_UP_DAYS` in `.env` to a value from 1 to 90; the worker checks the reminder queue at 08:00 UTC and creates a saved, editable draft when a reminder is due. The draft uses only the employer, role, confirmed submission date, and profile name, and requires your approval. The dashboard does not send email or calendar messages. After sending or handling the message yourself, mark it handled in the application record. Application notes and the event history stay in the authenticated dashboard.
 
-After Phase 7 changes, rebuild and migrate with `docker compose up -d --build` and `docker compose exec api alembic upgrade head`. See [docs/tracking-and-hardening.md](docs/tracking-and-hardening.md) for status behavior, recovery, privacy, and deployment limitations.
+After a schema change, stop the API and worker, start `db` and `redis`, apply migrations with `docker compose run --build --rm api alembic upgrade head`, then rebuild and start `api` and `worker`. See [docs/tracking-and-hardening.md](docs/tracking-and-hardening.md) for status behavior, recovery, privacy, and deployment limitations.
 
 ## Included phases
 

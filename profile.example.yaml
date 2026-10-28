@@ -1,0 +1,33 @@
+full_name: ""
+contact:
+  email: ""
+  phone: ""
+location:
+  city: ""
+  region: ""
+  country: ""
+work_authorization:
+  countries: []
+  notes: ""
+work_preferences:
+  arrangements: []
+  locations: []
+target_roles: []
+years_experience: null
+skills: []
+work_history: []
+projects: []
+education: []
+certifications: []
+links:
+  portfolio: ""
+  github: ""
+  linkedin: ""
+  other: []
+salary_expectations:
+  minimum: null
+  maximum: null
+  currency: ""
+employment_preferences:
+  preferences: []
+  deal_breakers: []
