@@ -23,8 +23,9 @@ def field(key, label, control="text", required=True, visible=True):
     return FormFieldSnapshot(key=key, label=label, control_type=control, required=required, visible=visible)
 
 
-def plan(form):
-    profile = Profile(full_name="Ada Lovelace", contact={"email": "ada@example.test"})
+def plan(form, profile: Profile | None = None):
+    if profile is None:
+        profile = Profile(full_name="Ada Lovelace", contact={"email": "ada@example.test"})
     return build_submission_plan(
         form, profile, application_id=uuid4(), approval_id=uuid4(), document_version=2,
         verification_id=uuid4(), answers_hash="a" * 64, profile_hash="b" * 64,
@@ -75,7 +76,7 @@ def test_unsafe_form_configuration_stops(kwargs, code):
 
 def test_missing_required_fact_and_duplicate_source_stop():
     with pytest.raises(SubmissionBlocked) as missing:
-        plan(snapshot(field("id:email", "Email", "email")))
+        plan(snapshot(field("id:email", "Email", "email")), Profile(full_name="Ada Lovelace"))
     assert missing.value.reason_code == "MISSING_PROFILE_FACT"
     with pytest.raises(SubmissionBlocked) as duplicate:
         plan(snapshot(field("id:email", "Email", "email"), field("id:contact_email", "Email address", "email")))
