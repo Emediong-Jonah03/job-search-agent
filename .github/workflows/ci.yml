@@ -17,6 +17,9 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      APP_ENV: test
+      APP_SECRET_KEY: ci-only-ephemeral-key-7e9b2d4c6a1f
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
