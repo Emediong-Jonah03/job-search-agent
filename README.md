@@ -64,6 +64,16 @@ The UI is server-rendered HTML with native forms and a small local stylesheet in
 
 See [docs/approval-dashboard.md](docs/approval-dashboard.md) for authentication behavior, review flow, and security limitations.
 
+## Hosted application form submission (Phase 6)
+
+Submission is limited to supported Greenhouse and Lever hosted forms. The dashboard first inspects the page without entering applicant data, saves a preview bound to the active approval, document version, profile hash, verification, and reviewed screening answers, then requires a separate **Submit application now** confirmation. It stops on login, CAPTCHA, unknown or ambiguous fields, changed forms, unsupported hosts, or validation errors. Unsupported application flows must be completed manually.
+
+Rebuild the Docker image after updating dependencies so it installs Playwright and Chromium. Submission screenshots are stored under the private artifacts directory; a screenshot alone never confirms success. The application becomes `SUBMITTED` only after the hosted page displays an explicit confirmation marker. If the result is uncertain, the application is locked against retry until you check the employer site and record a manual reconciliation.
+
+Greenhouse's application API requires an employer-specific API key, and Lever's custom posting API requires a Super Admin-generated key. This project does not request or store those employer credentials; it uses the supported hosted form and stops when it cannot safely understand it. See [Greenhouse Job Board API](https://docs.greenhouse.io/job-board) and [Lever Postings API](https://github.com/lever/postings-api).
+
+The automated test suite uses synthetic form snapshots and does not submit real applications. Browser integration requires a running Docker stack and a user-triggered dashboard submission; do not use a live job application as a test fixture.
+
 ## Included phases
 
 - Phase 1: FastAPI, PostgreSQL, Redis, ARQ, profile contracts, state machine, audit helper, health checks.
@@ -71,6 +81,7 @@ See [docs/approval-dashboard.md](docs/approval-dashboard.md) for authentication 
 - Phase 3: Posting evidence assessment and persisted verification records.
 - Phase 4: Structured job description analysis, exact profile-backed CV/cover-letter content, claim validation, PDF/DOCX rendering, private versioned storage, and audit records.
 - Phase 5: Authenticated dashboard, job/evidence review, document preview/editing, screening review, disclosure summary, and explicit approval gate.
+- Phase 6: Allowlisted Greenhouse and Lever hosted-form inspection, exact-field preview and explicit submission, durable attempt locking, confirmation evidence, and manual reconciliation for uncertain outcomes.
 
 ## Security and operations
 

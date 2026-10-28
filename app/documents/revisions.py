@@ -42,6 +42,9 @@ def revise_application_document(
     app = session.get(Application, application_id)
     if app is None:
         raise DocumentRevisionError("Application not found")
+    if app.submission_lock:
+        session.rollback()
+        raise DocumentRevisionError("Submission outcome must be reconciled before editing documents")
     allowed = {ApplicationState.CV_GENERATED.value, ApplicationState.AWAITING_APPROVAL.value, ApplicationState.APPROVED.value}
     if app.state not in allowed:
         raise DocumentRevisionError("Documents can no longer be edited in this application state")
@@ -61,7 +64,7 @@ def revise_application_document(
 
     with session.begin():
         locked = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
-        if locked is None or locked.state not in allowed:
+        if locked is None or locked.state not in allowed or locked.submission_lock:
             raise DocumentRevisionError("Application state changed while editing")
         version = session.scalar(select(func.coalesce(func.max(ApplicationDocument.version), 0)).where(
             ApplicationDocument.application_id == application_id

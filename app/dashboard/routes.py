@@ -1,5 +1,6 @@
 import html
 import json
+import hashlib
 import secrets
 import time
 from datetime import datetime, timezone
@@ -25,6 +26,9 @@ from app.documents.revisions import DocumentRevisionError, revise_application_do
 from app.domain.models import ApplicationState
 from app.domain.state_machine import InvalidTransition, transition
 from app.profile.loader import ProfileLoadError, load_profile
+from app.submission.browser import HostedFormBrowser
+from app.submission.planning import SubmissionBlocked, build_submission_plan, resolve_plan_value
+from app.submission.models import SubmissionPlan
 
 
 router = APIRouter()
@@ -420,11 +424,27 @@ def application_detail(application_id: UUID, request: Request, session: Session 
     elif application.state == ApplicationState.APPROVED.value:
         approved_version = active_approval.document_version if active_approval else "Unavailable"
         approval_info = f' by {_e(active_approval.approved_by)} at {_e(active_approval.approved_at)}' if active_approval else ''
-        body += f'<p class="callout success">Approved{approval_info} for a future submission workflow with document version {_e(approved_version)}. No application has been submitted.</p>'
+        body += f'<p class="callout success">Approved{approval_info} for submission with document version {_e(approved_version)}. Approval alone does not submit anything.</p>'
+        active_attempt = next((item for item in submission_attempts if item.status in {"PREPARED", "IN_PROGRESS", "OUTCOME_UNKNOWN"}), None)
+        if active_attempt and active_attempt.status == "PREPARED":
+            saved_plan = SubmissionPlan.model_validate(active_attempt.result_metadata["plan"])
+            doc = session.scalar(select(ApplicationDocument).where(ApplicationDocument.application_id == application.id, ApplicationDocument.version == saved_plan.document_version))
+            body += '<div class="callout"><strong>Review the exact application-form data</strong><ul>'
+            for item in saved_plan.fields:
+                value = resolve_plan_value(profile, item, {"cv_pdf_path": doc.cv_pdf_path, "cover_letter_pdf_path": doc.cover_letter_pdf_path} if doc else {})
+                display = "CV PDF version " + str(saved_plan.document_version) if item.document_key == "cv_pdf_path" else "Cover letter PDF version " + str(saved_plan.document_version) if item.document_key == "cover_letter_pdf_path" else value
+                body += f'<li><strong>{_e(item.label)}:</strong> {_e(display)}</li>'
+            body += '</ul></div>'
+            body += f'<form method="post" action="/applications/{application.id}/submit">{csrf}<input type="hidden" name="attempt_id" value="{_e(active_attempt.id)}"><label><input type="checkbox" name="confirm" value="yes" required> I reviewed these exact fields and documents and want to submit this application now.</label><p><button class="danger" type="submit">Submit application now</button></p></form>'
+        elif not active_attempt and active_approval and document and document.version == active_approval.document_version and verification:
+            body += f'<form method="post" action="/applications/{application.id}/prepare-submission">{csrf}<button type="submit">Inspect supported application form</button></form><p class="muted">This opens the hosted form without entering personal data. Unknown fields, login, CAPTCHA, and changed forms stop the workflow.</p>'
+        elif active_attempt and active_attempt.status in {"IN_PROGRESS", "OUTCOME_UNKNOWN"}:
+            body += '<p class="callout error"><strong>Submission outcome is uncertain. Do not submit again.</strong> Check the employer site directly and reconcile the attempt manually.</p>'
+            body += f'<form method="post" action="/applications/{application.id}/reconcile-submission">{csrf}<input type="hidden" name="attempt_id" value="{_e(active_attempt.id)}"><label for="resolution">After checking the employer site, select the confirmed result</label><select id="resolution" name="resolution" required><option value="">Choose a result</option><option value="submitted">Definitely submitted</option><option value="not_submitted">Definitely not submitted</option></select><label for="evidence_ref">Confirmation number or reconciliation note</label><input id="evidence_ref" name="evidence_ref" maxlength="500" required><label><input type="checkbox" name="reconcile_confirm" value="yes" required> I checked the employer site and confirm this result.</label><button type="submit">Record reconciliation</button></form>'
     else:
         body += f'<p class="muted">Current state: {_e(application.state.replace("_", " "))}</p>'
     terminal = {ApplicationState.SUBMITTED.value, ApplicationState.FOLLOW_UP.value, ApplicationState.SKIPPED.value, ApplicationState.REJECTED_BY_VERIFICATION.value}
-    if application.state not in terminal:
+    if application.state not in terminal and not application.submission_lock:
         body += f'<form method="post" action="/applications/{application.id}/skip" class="actions">{csrf}<button class="danger" type="submit">Skip this application</button></form>'
     body += '</section>'
     body += '<section class="card"><h2>Submission and follow-up</h2>'
@@ -432,6 +452,7 @@ def application_detail(application_id: UUID, request: Request, session: Session 
         body += '<ul>'
         for attempt in submission_attempts:
             message = {
+                "PREPARED": "Form inspected — awaiting your explicit submit confirmation",
                 "CONFIRMED_SUCCESS": "Confirmed successful",
                 "CONFIRMED_FAILURE": "Confirmed failed",
                 "OUTCOME_UNKNOWN": "Outcome unknown — reconcile manually; do not retry blindly",
@@ -443,6 +464,10 @@ def application_detail(application_id: UUID, request: Request, session: Session 
             for key in ("confirmation_number", "confirmation_text"):
                 if metadata.get(key):
                     body += f'<br>{_e(key.replace("_", " ").title())}: {_e(metadata[key])}'
+            if metadata.get("reason"):
+                body += f'<br>{_e(metadata["reason"])}'
+            if metadata.get("screenshot_path"):
+                body += f'<br><a href="/applications/{application.id}/submission-evidence/{attempt.id}">View private submission screenshot</a>'
             body += '</li>'
         body += '</ul>'
     else:
@@ -594,6 +619,8 @@ async def skip(application_id: UUID, request: Request, session: Session = Depend
         application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
         if application is None:
             raise HTTPException(status_code=404, detail="Application not found")
+        if application.submission_lock:
+            raise HTTPException(status_code=409, detail="Submission outcome must be reconciled before changing this application")
         active_approval = session.scalar(select(ApplicationApproval).where(
             ApplicationApproval.application_id == application_id,
             ApplicationApproval.invalidated_at.is_(None),
@@ -622,3 +649,166 @@ async def skip(application_id: UUID, request: Request, session: Session = Depend
             payload={"previous_state": change.previous.value, "new_state": change.new.value, "reason": change.reason},
         ))
     return RedirectResponse("/dashboard", status_code=303)
+
+
+@router.post("/applications/{application_id}/prepare-submission", include_in_schema=False)
+async def prepare_submission(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    _check_csrf(request, await _form(request))
+    application = session.get(Application, application_id)
+    if application is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if application.state != ApplicationState.APPROVED.value or application.submission_lock:
+        raise HTTPException(status_code=409, detail="Application is not eligible for form preparation")
+    approval = session.scalar(select(ApplicationApproval).where(ApplicationApproval.application_id == application_id, ApplicationApproval.invalidated_at.is_(None)).order_by(ApplicationApproval.approved_at.desc()).limit(1))
+    document = _latest_document(session, application_id)
+    job = session.get(Job, application.job_id)
+    verification = _latest_verification(session, job.id)
+    questions = list(session.scalars(select(ScreeningQuestion).where(ScreeningQuestion.application_id == application_id).order_by(ScreeningQuestion.id)))
+    answers_hash = screening_answers_hash([{"question_id": str(q.id), "status": q.status, "answer": q.answer, "profile_path": q.answer_profile_path} for q in questions])
+    profile = _profile()
+    profile_hash = hashlib.sha256(json.dumps(profile.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if not approval or not document or not verification or document.version != approval.document_version or str(verification.id) != str(approval.verification_id) or verification.classification != "VERIFIED" or answers_hash != approval.answers_hash or profile_hash != document.profile_hash:
+        raise HTTPException(status_code=409, detail="Approval facts changed or are incomplete. Re-review this application before continuing.")
+    try:
+        snapshot = await HostedFormBrowser().inspect(job.canonical_url)
+        plan = build_submission_plan(snapshot, profile, application_id=application.id, approval_id=approval.id, document_version=document.version, verification_id=verification.id, answers_hash=answers_hash, profile_hash=profile_hash, job_url=job.canonical_url, artifact_paths={"cv_pdf_path": document.cv_pdf_path, "cover_letter_pdf_path": document.cover_letter_pdf_path}, artifact_hashes={"cv_pdf_path": document.file_hashes.get("cv.pdf", ""), "cover_letter_pdf_path": document.file_hashes.get("cover-letter.pdf", "")})
+    except SubmissionBlocked as exc:
+        session.rollback()
+        with session.begin():
+            session.add(SubmissionAttempt(application_id=application.id, status="CONFIRMED_FAILURE", idempotency_key=secrets.token_urlsafe(32), started_at=datetime.now(timezone.utc), finished_at=datetime.now(timezone.utc), result_metadata={"reason_code": exc.reason_code, "reason": str(exc), "submission_clicked": False}))
+        return RedirectResponse(f"/applications/{application_id}", status_code=303)
+    session.rollback()
+    with session.begin():
+        locked = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        prior = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.application_id == application_id, SubmissionAttempt.status.in_(["PREPARED", "IN_PROGRESS", "OUTCOME_UNKNOWN", "CONFIRMED_SUCCESS"])).with_for_update())
+        if not locked or locked.state != ApplicationState.APPROVED.value or locked.submission_lock or prior:
+            raise HTTPException(status_code=409, detail="A submission attempt is already active or the application changed")
+        session.add(SubmissionAttempt(application_id=application_id, status="PREPARED", idempotency_key=secrets.token_urlsafe(32), started_at=datetime.now(timezone.utc), result_metadata={"plan": plan.model_dump(mode="json"), "stage": "PREPARED", "submission_clicked": False}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/submit", include_in_schema=False)
+async def submit_application(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("confirm") != ["yes"]:
+        raise HTTPException(status_code=422, detail="Explicit submission confirmation is required")
+    try:
+        attempt_id = UUID(data.get("attempt_id", [""])[0])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Prepared submission is invalid") from exc
+    with session.begin():
+        application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        attempt = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.id == attempt_id, SubmissionAttempt.application_id == application_id).with_for_update())
+        if not application or application.state != ApplicationState.APPROVED.value or application.submission_lock or not attempt or attempt.status != "PREPARED":
+            raise HTTPException(status_code=409, detail="This submission is no longer prepared. Do not retry automatically.")
+        approval = session.get(ApplicationApproval, UUID(attempt.result_metadata["plan"]["approval_id"]))
+        doc = session.scalar(select(ApplicationDocument).where(ApplicationDocument.application_id == application_id, ApplicationDocument.version == attempt.result_metadata["plan"]["document_version"]))
+        plan = SubmissionPlan.model_validate(attempt.result_metadata["plan"])
+        job = session.get(Job, application.job_id)
+        verification = _latest_verification(session, job.id)
+        questions = list(session.scalars(select(ScreeningQuestion).where(ScreeningQuestion.application_id == application_id).order_by(ScreeningQuestion.id)))
+        answers_hash = screening_answers_hash([{"question_id": str(q.id), "status": q.status, "answer": q.answer, "profile_path": q.answer_profile_path} for q in questions])
+        profile = _profile()
+        profile_hash = hashlib.sha256(json.dumps(profile.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if not approval or approval.invalidated_at or not doc or not verification or verification.classification != "VERIFIED" or str(verification.id) != plan.verification_id or doc.version != plan.document_version or approval.answers_hash != answers_hash or plan.answers_hash != answers_hash or plan.profile_hash != profile_hash or doc.profile_hash != profile_hash:
+            raise HTTPException(status_code=409, detail="Reviewed data changed. Prepare the form again after reviewing the application.")
+        attempt.status = "IN_PROGRESS"
+        attempt.result_metadata = {**attempt.result_metadata, "stage": "SUBMITTING", "submission_clicked": False}
+        application.submission_lock = True
+    plan_paths = {"cv_pdf_path": doc.cv_pdf_path, "cover_letter_pdf_path": doc.cover_letter_pdf_path}
+    try:
+        result = await HostedFormBrowser().submit(plan, profile, plan_paths)
+    except SubmissionBlocked as exc:
+        with session.begin():
+            application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+            attempt = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.id == attempt_id).with_for_update())
+            application.submission_lock = False
+            attempt.status = "CONFIRMED_FAILURE"
+            attempt.finished_at = datetime.now(timezone.utc)
+            attempt.result_metadata = {"reason_code": exc.reason_code, "reason": str(exc), "submission_clicked": False}
+        return RedirectResponse(f"/applications/{application_id}", status_code=303)
+    with session.begin():
+        application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        attempt = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.id == attempt_id).with_for_update())
+        status = result.status
+        attempt.status = status
+        attempt.finished_at = datetime.now(timezone.utc)
+        metadata = {"reason_code": result.reason_code, "submission_clicked": result.submission_clicked, "confirmation_number": result.confirmation_number, "confirmation_text": result.confirmation_marker}
+        if result.screenshot_bytes:
+            root = Path(get_settings().artifacts_path).expanduser().resolve()
+            folder = root / str(application_id) / "submission-evidence"
+            folder.mkdir(parents=True, exist_ok=True)
+            evidence = folder / f"{attempt_id}.png"
+            evidence.write_bytes(result.screenshot_bytes)
+            metadata["screenshot_path"] = str(evidence)
+        attempt.result_metadata = metadata
+        if result.status == "CONFIRMED_SUCCESS":
+            application.submission_lock = False
+            change = transition(ApplicationState.APPROVED, ApplicationState.SUBMITTED, "dashboard-user", "Hosted form showed explicit application confirmation")
+            application.state = change.new.value
+            application.version += 1
+            session.add(ApplicationTransition(application_id=application.id, previous_state=change.previous.value, new_state=change.new.value, actor="dashboard-user", reason=change.reason, metadata_json={"attempt_id": str(attempt.id)}))
+            session.add(AuditEvent(event_type="application.submission.confirmed", actor="dashboard-user", application_id=application.id, payload={"attempt_id": str(attempt.id), "confirmation_number": result.confirmation_number}))
+        elif result.status == "CONFIRMED_FAILURE" and not result.submission_clicked:
+            application.submission_lock = False
+        else:
+            application.submission_lock = True
+            attempt.status = "OUTCOME_UNKNOWN"
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.post("/applications/{application_id}/reconcile-submission", include_in_schema=False)
+async def reconcile_submission(application_id: UUID, request: Request, session: Session = Depends(get_db)):
+    if not _is_authenticated(request):
+        return _login_redirect()
+    data = await _form(request)
+    _check_csrf(request, data)
+    if data.get("reconcile_confirm") != ["yes"]:
+        raise HTTPException(status_code=422, detail="Confirm that you checked the employer site")
+    ref = data.get("evidence_ref", [""])[0].strip()[:500]
+    if not ref or data.get("resolution", [""])[0] not in {"submitted", "not_submitted"}:
+        raise HTTPException(status_code=422, detail="A confirmed outcome and reconciliation note are required")
+    try:
+        attempt_id = UUID(data.get("attempt_id", [""])[0])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Submission attempt is invalid") from exc
+    with session.begin():
+        application = session.scalar(select(Application).where(Application.id == application_id).with_for_update())
+        attempt = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.id == attempt_id, SubmissionAttempt.application_id == application_id).with_for_update())
+        if not application or not application.submission_lock or not attempt or attempt.status not in {"IN_PROGRESS", "OUTCOME_UNKNOWN"}:
+            raise HTTPException(status_code=409, detail="There is no uncertain submission to reconcile")
+        if data["resolution"][0] == "submitted":
+            attempt.status = "CONFIRMED_SUCCESS"
+            application.state = ApplicationState.SUBMITTED.value
+            application.version += 1
+            session.add(ApplicationTransition(application_id=application_id, previous_state=ApplicationState.APPROVED.value, new_state=ApplicationState.SUBMITTED.value, actor="dashboard-user", reason="User reconciled the hosted application as submitted", metadata_json={"attempt_id": str(attempt_id)}))
+            event_type = "application.submission.reconciled_success"
+        else:
+            attempt.status = "CONFIRMED_FAILURE"
+            event_type = "application.submission.reconciled_not_submitted"
+        attempt.finished_at = datetime.now(timezone.utc)
+        attempt.result_metadata = {**(attempt.result_metadata or {}), "reconciliation_reference": ref, "reconciled_by": "dashboard-user"}
+        application.submission_lock = False
+        session.add(AuditEvent(event_type=event_type, actor="dashboard-user", application_id=application_id, payload={"attempt_id": str(attempt_id)}))
+    return RedirectResponse(f"/applications/{application_id}", status_code=303)
+
+
+@router.get("/applications/{application_id}/submission-evidence/{attempt_id}", include_in_schema=False)
+def submission_evidence(application_id: UUID, attempt_id: UUID, request: Request, session: Session = Depends(get_db)):
+    redirect = _require_user(request)
+    if redirect:
+        return redirect
+    attempt = session.scalar(select(SubmissionAttempt).where(SubmissionAttempt.id == attempt_id, SubmissionAttempt.application_id == application_id))
+    path_value = (attempt.result_metadata or {}).get("screenshot_path") if attempt else None
+    if not path_value:
+        raise HTTPException(status_code=404, detail="Submission evidence not found")
+    root = Path(get_settings().artifacts_path).expanduser().resolve()
+    path = Path(path_value).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Submission evidence not found")
+    return FileResponse(path, media_type="image/png", filename="submission-evidence.png", headers={"Cache-Control": "no-store"})

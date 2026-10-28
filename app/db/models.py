@@ -48,6 +48,7 @@ class Application(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     match_score: Mapped[int | None] = mapped_column(Integer)
     match_details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    submission_lock: Mapped[bool] = mapped_column(nullable=False, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
