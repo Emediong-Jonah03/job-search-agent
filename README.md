@@ -36,6 +36,92 @@ Database and Redis data persist in Compose volumes. To reset a development datab
 
 For local Python setup, create a Python 3.12 virtual environment, then run `python -m pip install -e '.[dev]'`. Apply migrations with `alembic upgrade head`; run tests with `python -m pytest`.
 
+## HTTP API and dashboard endpoint reference
+
+The application exposes JSON health endpoints and an authenticated, server-rendered HTML dashboard. Application workflow routes use HTML forms and redirects; they are **not** a public JSON CRUD API. Unless a route is identified as a health check or static asset, it requires the dashboard session. All dashboard mutations require a CSRF token.
+
+### Base URL and common request rules
+
+- Local base URL: `http://localhost:8000` (Compose binds the API to `127.0.0.1`).
+- Path parameters named `application_id`, `document_id`, `question_id`, `attempt_id`, or `reminder_id` are UUIDs.
+- Form POSTs use `application/x-www-form-urlencoded`, with `csrf_token` copied from the form rendered by the corresponding GET page. The server accepts at most 1 MiB per form body and 100 form fields.
+- An unauthenticated dashboard request redirects to `/login` with HTTP `303`. Successful form mutations normally redirect with HTTP `303`; they do not return a JSON resource body.
+- Error responses are HTML or FastAPI's standard error response. Common statuses are `403` for an invalid/missing CSRF token, `404` for a missing application or artifact, `409` for a state conflict or stale review, `413` for an oversized form, and `422` for invalid/missing form values. Login failures return `401`; repeated failures are limited to eight per client address in a ten-minute window within each API process.
+
+### Health, docs, and static assets
+
+| Method and path | Authentication | Response |
+| --- | --- | --- |
+| `GET /health/live` | None | JSON `{"status":"ok"}` with HTTP `200`; confirms the API process responds. |
+| `GET /health/ready` | None | JSON `{"status":"ready","environment":"..."}` with HTTP `200`, or `{"status":"not_ready"}` with HTTP `503`. Checks the PostgreSQL connection only; it does not verify Redis, worker health, or migration version. |
+| `GET /docs`, `GET /redoc`, `GET /openapi.json` | None | FastAPI's generated API documentation/schema. Dashboard routes are excluded from OpenAPI, so the schema lists health routes, not the HTML form workflows documented here. |
+| `GET /static/{path}` | None | Local dashboard CSS/static assets. |
+
+Windows quick checks:
+
+```powershell
+curl.exe -i http://localhost:8000/health/live
+curl.exe -i http://localhost:8000/health/ready
+```
+
+### Sign-in and dashboard navigation
+
+| Method and path | Request | Success |
+| --- | --- | --- |
+| `GET /` | No body | Redirects to `/dashboard` if signed in, otherwise `/login` (`303`). |
+| `GET /login` | No body | Sign-in HTML with a session-bound hidden `csrf_token`. If `DASHBOARD_PASSWORD` is unset, returns a setup page instead. |
+| `POST /login` | Form fields: `csrf_token`, `password` | On success, rotates the session and redirects to `/dashboard` (`303`). Wrong password returns `401`; missing/invalid token returns `403`; rate limit returns `429`; unset password returns `503`. |
+| `POST /logout` | Authenticated form field: `csrf_token` | Clears the session and redirects to `/login` (`303`). |
+| `GET /dashboard` | Optional query: `state` | Applications queue HTML. `state` must be one of `DISCOVERED`, `VERIFIED`, `SHORTLISTED`, `CV_GENERATED`, `AWAITING_APPROVAL`, `APPROVED`, `SUBMITTED`, `FOLLOW_UP`, `REJECTED_BY_VERIFICATION`, or `SKIPPED`; unknown values return `422`. |
+| `GET /follow-ups` | No body | Follow-up reminder list HTML, including status and scheduled timestamp in UTC. |
+| `GET /applications/{application_id}` | UUID path parameter | Application detail HTML: job and verification evidence, match details, document versions, screening questions, approval/submission status, notes, reminders, and state history. |
+
+### Application documents and screening review
+
+| Method and path | Request | Success and behavior |
+| --- | --- | --- |
+| `GET /applications/{application_id}/documents/{slug}` | Optional query: `version` (positive document version), `inline=1` | Authenticated file response. `slug` is `cv-pdf`, `cv-docx`, `cover-letter-pdf`, or `cover-letter-docx`. Without `version`, returns the latest version. PDFs display inline only when `inline=1`; otherwise files download. Missing/invalid document returns `404`. |
+| `POST /applications/{application_id}/documents/{document_id}/revise` | Form: `csrf_token`, `content_json` (JSON-encoded `ApplicationDocumentContent`) | Validates profile-backed CV/cover-letter claims and saved job identity, creates an immutable document version, and invalidates prior approval. Redirects to application detail (`303`); validation errors return an HTML `422` page. Editing is blocked while submission outcome is locked or the application is terminal. |
+| `POST /applications/{application_id}/screening/{question_id}/review` | Form: `csrf_token`, and either `profile_path` (exact non-empty profile fact path) or `needs_clarification=yes` | Stores a reviewed answer or marks it as needing clarification, records an audit event, and redirects to application detail (`303`). Only `CV_GENERATED` and `AWAITING_APPROVAL` applications can be changed; invalid state returns `409`, invalid fact selection returns `422`. |
+
+`content_json` must match the strict `ApplicationDocumentContent` model in `app/documents/models.py`: top-level `cv`, `cover_letter`, `job_analysis`, and `cover_letter_word_count`; unknown fields are rejected. The document route is for the structured source and does not accept arbitrary generated file uploads.
+
+### Approval and application state actions
+
+| Method and path | Form fields | Success and behavior |
+| --- | --- | --- |
+| `POST /applications/{application_id}/request-approval` | `csrf_token` | Moves an eligible generated application to `AWAITING_APPROVAL`; redirects to detail (`303`). Ineligible applications return `409`. |
+| `POST /applications/{application_id}/approve` | `csrf_token`, `confirm=yes`, `document_version`, `verification_id`, `answers_hash` | Records explicit per-application approval only if the latest verified posting, claim-checked document, and screening-answer snapshot still match. Redirects to detail (`303`); stale or blocked approval returns `409`; missing confirmation returns `422`. |
+| `POST /applications/{application_id}/skip` | `csrf_token` | Invalidates active approval, transitions the application to `SKIPPED`, and redirects to `/dashboard` (`303`). Invalid state or submission lock returns `409`. |
+
+Approval is not submission. Submission requires its own form inspection, preview, and final explicit confirmation.
+
+### Hosted-form submission
+
+| Method and path | Form fields | Success and behavior |
+| --- | --- | --- |
+| `POST /applications/{application_id}/prepare-submission` | `csrf_token` | Opens the allowlisted hosted posting for inspection without entering personal data, then saves a prepared form plan for dashboard review. Redirects to detail (`303`). Unsupported fields, login, CAPTCHA, redirects, or unsafe forms are recorded as a safe pre-submit failure; an active or changed application returns `409`. |
+| `POST /applications/{application_id}/submit` | `csrf_token`, `attempt_id`, `confirm=yes` | Revalidates the approval/profile/document/verification snapshot, fills only reviewed supported fields, and invokes the hosted form submit control. Redirects to detail (`303`). A stale plan or unresolved attempt returns `409`; explicit confirmation is required (`422`). The outcome is recorded as confirmed success, confirmed failure, or unknown; unknown outcomes are locked against blind retry. |
+| `POST /applications/{application_id}/reconcile-submission` | `csrf_token`, `attempt_id`, `resolution=submitted` or `not_submitted`, `evidence_ref`, `reconcile_confirm=yes` | Records the user's external check for an in-progress/unknown result. `evidence_ref` is required (max 500 characters). A confirmed submission changes the application to `SUBMITTED` and creates its reminder; a confirmed non-submission unlocks it for a later reviewed attempt. Invalid resolution or stale attempt returns `409`/`422`. |
+| `GET /applications/{application_id}/submission-evidence/{attempt_id}` | UUID path parameters | Authenticated, private PNG screenshot response with `Cache-Control: no-store`. Returns `404` if no stored evidence exists. |
+
+Supported browser submission hosts are restricted to Greenhouse and Lever hosted application pages. The server does not expose a generic browser-control endpoint and does not bypass CAPTCHA or login. An uncertain result must be reconciled before another attempt.
+
+### Application notes and follow-ups
+
+| Method and path | Form fields | Success and behavior |
+| --- | --- | --- |
+| `POST /applications/{application_id}/notes` | `csrf_token`, `body` (1–5,000 characters) | Adds an append-only private application note and redirects to detail (`303`). |
+| `POST /applications/{application_id}/follow-ups/{reminder_id}/save-draft` | `csrf_token`, `draft_text` (1–5,000 characters) | Saves edits to a draft in `DRAFTED` status. Other statuses return `409`. |
+| `POST /applications/{application_id}/follow-ups/{reminder_id}/approve` | `csrf_token`, `draft_text`, `confirm=yes` | Saves and explicitly approves the draft for manual use; it does not send the message. |
+| `POST /applications/{application_id}/follow-ups/{reminder_id}/complete` | `csrf_token`, `confirm=yes`, optional `completion_note` (max 1,000 characters) | Records that the user handled the follow-up outside the dashboard. Completes the reminder and transitions `SUBMITTED` to `FOLLOW_UP`. Only an approved draft can be completed. |
+
+The worker creates one reminder only for confirmed submissions. The default delay is seven days (`FOLLOW_UP_DAYS`, range 1–90); due drafts are generated on the daily worker schedule. The dashboard has no email/calendar send endpoint.
+
+### Form workflow examples
+
+For browser-based use, open `/login`, sign in, and use the forms on the application detail page; this preserves the signed session cookie and CSRF tokens. A submission workflow is: approve an application, choose **Inspect supported application form**, review the prepared field/document preview, then separately choose **Submit application now**. A follow-up workflow is: wait for the due draft, edit it if needed, explicitly approve it, send/handle it outside the dashboard, and mark it handled.
+
 ## Discovery and matching (Phase 2)
 
 Configure public job boards using `DISCOVERY_BOARDS` in `.env`, with semicolon-separated entries such as `greenhouse:acme;lever:acme;ashby:Acme`. A board token/site/board name must be known; these endpoints do not provide cross-employer search. The ARQ worker runs configured board discovery at startup and daily at 07:00 UTC. Only explicitly listed boards are queried. Workable's current documented job API requires an employer-generated API token with the `r_jobs` scope, so it is not treated as a generally public source in this release.
