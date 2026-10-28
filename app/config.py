@@ -20,12 +20,20 @@ class Settings(BaseSettings):
     follow_up_days: int = Field(default=7, ge=1, le=90)
     verification_verified_threshold: int = Field(default=70, ge=1, le=100)
     verification_suspicious_risk_threshold: int = Field(default=40, ge=1, le=1000)
-    llm_provider: Literal["mock", "claude", "gemini", "groq"] = "mock"
+    llm_provider: Literal["auto", "mock", "openai", "claude", "gemini", "groq", "xai"] = "mock"
     llm_model: str = "mock"
+    llm_auto_priority: str = "xai,gemini,openai,claude,groq"
     llm_timeout_seconds: int = Field(default=45, ge=5, le=180)
+    openai_api_key: SecretStr | None = None
     anthropic_api_key: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
+    xai_api_key: SecretStr | None = None
+    openai_model: str = "gpt-6-luna"
+    claude_model: str = "claude-sonnet-5"
+    gemini_model: str = "gemini-3.8-flash"
+    groq_model: str = "openai/gpt-oss-120b"
+    xai_model: str = "grok-4.7"
     anthropic_api_version: str = "2023-06-01"
     dashboard_password: SecretStr | None = None
 

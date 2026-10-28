@@ -5,7 +5,13 @@ from app.db.models import AuditEvent
 from app.config import get_settings
 from app.db.session import SessionLocal
 from app.discovery.adapters import AshbyAdapter, GreenhouseAdapter, LeverAdapter
-from app.discovery.http import get_json
+from app.discovery.adapters.public_feeds import (
+    JobicyAdapter,
+    RemotiveAdapter,
+    RemoteOKAdapter,
+    WeWorkRemotelyAdapter,
+)
+from app.discovery.http import get_json, get_text
 from app.discovery.models import BoardConfig
 from app.discovery.service import check_live_link, fresh_jobs, parse_board_config
 from app.discovery.repository import persist_discovery
@@ -19,6 +25,10 @@ ADAPTERS = {
     "greenhouse": GreenhouseAdapter,
     "lever": LeverAdapter,
     "ashby": AshbyAdapter,
+    "remoteok": RemoteOKAdapter,
+    "remotive": RemotiveAdapter,
+    "jobicy": JobicyAdapter,
+    "weworkremotely": WeWorkRemotelyAdapter,
 }
 
 
@@ -30,7 +40,8 @@ async def discover_configured_boards(_: dict) -> dict[str, int]:
     errors = 0
 
     for board_config in board_configs:
-        adapter = ADAPTERS[board_config.source](get_json)
+        adapter_class = ADAPTERS[board_config.source]
+        adapter = adapter_class(get_json, get_text) if board_config.source == "weworkremotely" else adapter_class(get_json)
         try:
             jobs = await adapter.fetch(board_config.board)
         except Exception as exc:

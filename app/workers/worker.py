@@ -12,6 +12,8 @@ class WorkerSettings:
     functions = [discover_configured_boards, refresh_follow_up_reminders]
     cron_jobs = [
         cron(discover_configured_boards, hour=7, minute=0, run_at_startup=True),
+        cron(discover_configured_boards, hour=13, minute=0),
+        cron(discover_configured_boards, hour=19, minute=0),
         cron(refresh_follow_up_reminders, hour=8, minute=0, run_at_startup=True),
     ]
     timezone = timezone.utc

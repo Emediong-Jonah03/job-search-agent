@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import random
 import re
 from urllib.parse import quote
@@ -14,6 +15,9 @@ from app.llm.models import JobDescriptionAnalysis, ProviderResult
 
 class LLMProviderError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 EXTRACTION_INSTRUCTIONS = (
@@ -137,9 +141,8 @@ class GeminiProvider(RemoteJSONProvider):
         return "".join(part.get("text", "") for part in payload["candidates"][0]["content"]["parts"])
 
 
-class GroqProvider(RemoteJSONProvider):
-    endpoint = "https://api.groq.com/openai/v1/chat/completions"
-    provider_name = "groq"
+class OpenAICompatibleJSONProvider(RemoteJSONProvider):
+    """Provider adapter for APIs using OpenAI-compatible chat completions."""
 
     def request(self, prompt: str) -> tuple[str, dict, dict]:
         return self.endpoint, {
@@ -166,23 +169,103 @@ class GroqProvider(RemoteJSONProvider):
         return payload["choices"][0]["message"]["content"]
 
 
+class OpenAIProvider(OpenAICompatibleJSONProvider):
+    endpoint = "https://api.openai.com/v1/chat/completions"
+    provider_name = "openai"
+
+
+class GroqProvider(OpenAICompatibleJSONProvider):
+    endpoint = "https://api.groq.com/openai/v1/chat/completions"
+    provider_name = "groq"
+
+
+class XAIProvider(OpenAICompatibleJSONProvider):
+    endpoint = "https://api.x.ai/v1/chat/completions"
+    provider_name = "xai"
+
+
+class AutomaticProvider(LLMProvider):
+    provider_name = "auto"
+
+    def __init__(self, providers: list[LLMProvider]):
+        if not providers:
+            raise ValueError("LLM_PROVIDER=auto requires at least one configured provider API key")
+        self.providers = providers
+
+    async def analyze_job_description(self, description: str) -> ProviderResult:
+        failures: list[LLMProviderError] = []
+        for index, provider in enumerate(self.providers):
+            try:
+                return await provider.analyze_job_description(description)
+            except LLMProviderError as exc:
+                failures.append(exc)
+                if index < len(self.providers) - 1:
+                    logger.warning("LLM provider %s failed; trying the next configured provider", provider.provider_name)
+        names = ", ".join(provider.provider_name for provider in self.providers)
+        raise LLMProviderError(f"All configured LLM providers failed ({names})") from failures[-1]
+
+
 def create_provider(settings: Settings) -> LLMProvider:
     if settings.llm_provider == "mock":
         return MockLLMProvider()
-    if settings.llm_model.strip().casefold() in {"", "mock"}:
-        raise ValueError("Set LLM_MODEL to a model name when using a hosted provider")
-    common = (settings.llm_model, settings.llm_timeout_seconds)
-    if settings.llm_provider == "claude":
-        if settings.anthropic_api_key is None:
-            raise ValueError("ANTHROPIC_API_KEY is required for the Claude provider")
-        return ClaudeProvider(settings.anthropic_api_key, *common, settings.anthropic_api_version)
-    if settings.llm_provider == "gemini":
-        if settings.gemini_api_key is None:
-            raise ValueError("GEMINI_API_KEY is required for the Gemini provider")
-        return GeminiProvider(settings.gemini_api_key, *common)
-    if settings.llm_provider == "groq":
-        if settings.groq_api_key is None:
-            raise ValueError("GROQ_API_KEY is required for the Groq provider")
-        return GroqProvider(settings.groq_api_key, *common)
-    raise ValueError("Unsupported LLM provider")
+
+    providers = ("openai", "claude", "gemini", "groq", "xai")
+    api_keys = {
+        "openai": settings.openai_api_key,
+        "claude": settings.anthropic_api_key,
+        "gemini": settings.gemini_api_key,
+        "groq": settings.groq_api_key,
+        "xai": settings.xai_api_key,
+    }
+    models = {
+        "openai": settings.openai_model,
+        "claude": settings.claude_model,
+        "gemini": settings.gemini_model,
+        "groq": settings.groq_model,
+        "xai": settings.xai_model,
+    }
+
+    def build(name: str, *, automatic: bool) -> LLMProvider | None:
+        key = api_keys[name]
+        if key is None or not key.get_secret_value().strip():
+            if automatic:
+                return None
+            env_name = {
+                "openai": "OPENAI_API_KEY",
+                "claude": "ANTHROPIC_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+                "groq": "GROQ_API_KEY",
+                "xai": "XAI_API_KEY",
+            }[name]
+            raise ValueError(f"{env_name} is required for the {name} provider")
+
+        override = settings.llm_model.strip()
+        model = models[name] if automatic or override.casefold() in {"", "mock"} else override
+        if name == "openai":
+            return OpenAIProvider(key, model, settings.llm_timeout_seconds)
+        if name == "claude":
+            return ClaudeProvider(key, model, settings.llm_timeout_seconds, settings.anthropic_api_version)
+        if name == "gemini":
+            return GeminiProvider(key, model, settings.llm_timeout_seconds)
+        if name == "groq":
+            return GroqProvider(key, model, settings.llm_timeout_seconds)
+        if name == "xai":
+            return XAIProvider(key, model, settings.llm_timeout_seconds)
+        raise ValueError("Unsupported LLM provider")
+
+    if settings.llm_provider == "auto":
+        priority = [name.strip().casefold() for name in settings.llm_auto_priority.split(",") if name.strip()]
+        if not priority or any(name not in providers for name in priority):
+            allowed = ", ".join(providers)
+            raise ValueError(f"LLM_AUTO_PRIORITY must be a comma-separated list of: {allowed}")
+        if len(set(priority)) != len(priority):
+            raise ValueError("LLM_AUTO_PRIORITY cannot contain duplicate providers")
+        candidates = [build(name, automatic=True) for name in priority]
+        return AutomaticProvider([provider for provider in candidates if provider is not None])
+
+    if settings.llm_provider not in providers:
+        raise ValueError("Unsupported LLM provider")
+    provider = build(settings.llm_provider, automatic=False)
+    assert provider is not None
+    return provider
 

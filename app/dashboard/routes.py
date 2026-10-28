@@ -18,7 +18,7 @@ from app.approval.service import ApprovalDenied, approve_application, submit_for
 from app.config import get_settings
 from app.db.models import (
     Application, ApplicationApproval, ApplicationDocument, ApplicationNote, ApplicationTransition,
-    AuditEvent, FollowUpReminder, Job, JobVerification, ScreeningQuestion, SubmissionAttempt,
+    AuditEvent, FollowUpReminder, Job, JobSource, JobVerification, ScreeningQuestion, SubmissionAttempt,
     VerificationSignalRecord,
 )
 from app.db.session import SessionLocal
@@ -300,6 +300,9 @@ def application_detail(application_id: UUID, request: Request, session: Session 
     if application is None:
         raise HTTPException(status_code=404, detail="Application not found")
     job = session.get(Job, application.job_id)
+    job_source = session.scalar(
+        select(JobSource).where(JobSource.job_id == job.id).order_by(JobSource.observed_at.desc()).limit(1)
+    )
     verification = _latest_verification(session, job.id)
     document = _latest_document(session, application.id)
     documents = list(session.scalars(select(ApplicationDocument).where(
@@ -338,14 +341,29 @@ def application_detail(application_id: UUID, request: Request, session: Session 
     if any(question.status == "RESOLVED" and (not question.answer or not question.answer_profile_path) for question in questions):
         review_blockers.append("A resolved screening answer is missing its profile fact.")
     csrf = _csrf_input(request)
+    source_names = {
+        "remoteok": "Remote OK",
+        "remotive": "Remotive",
+        "jobicy": "Jobicy",
+        "weworkremotely": "We Work Remotely",
+        "greenhouse": "Greenhouse",
+        "lever": "Lever",
+        "ashby": "Ashby",
+    }
+    source_html = (
+        f'<dt>Source</dt><dd>{_e(source_names.get(job_source.adapter, job_source.adapter))} · '
+        f'<a href="{_e(job_source.source_url)}" target="_blank" rel="noopener noreferrer">Source feed</a></dd>'
+        if job_source else ""
+    )
     body = (
         '<p><a href="/dashboard">← Applications</a></p><p class="muted">APPLICATION REVIEW</p>'
         f'<h1>{_e(job.title)}</h1><p class="lede">{_e(job.employer)} · <span class="badge">{_e(application.state.replace("_", " "))}</span></p>'
         '<div class="grid"><section class="card"><h2>Job details</h2><dl class="fact-list">'
         f'<dt>Match score</dt><dd>{_e(str(application.match_score) + "/100" if application.match_score is not None else "Not scored")}</dd>'
         f'<dt>Original posting</dt><dd><a href="{_e(job.canonical_url)}" target="_blank" rel="noopener noreferrer">Open job listing</a></dd>'
-        f'<dt>Posted</dt><dd>{_e(job.posted_at or "Unknown")}</dd>'
-        f'<dt>Description</dt><dd>{_e(job.description or "No description saved")}</dd></dl></section>'
+        + source_html
+        + f'<dt>Posted</dt><dd>{_e(job.posted_at or "Unknown")}</dd>'
+        + f'<dt>Description</dt><dd>{_e(job.description or "No description saved")}</dd></dl></section>'
     )
     match = application.match_details or {}
     body += '<section class="card"><h2>Match assessment</h2>'
