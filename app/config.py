@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     profile_path: str = "profile.yaml"
     artifacts_path: str = "private-artifacts"
     log_level: str = "INFO"
+    discovery_boards: str = ""
 
 
 @lru_cache

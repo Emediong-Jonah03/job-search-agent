@@ -1,6 +1,6 @@
 # Job Application Agent
 
-Phase 1 establishes the local foundation for an application workflow that uses verified profile facts and requires explicit human approval before submission. Discovery, verification, document generation, dashboard actions, and ATS submission are not implemented in this phase.
+Phases 1 and 2 establish a local foundation and public ATS job discovery workflow for an application system that uses verified profile facts and requires explicit human approval before submission. Employer verification, document generation, the review dashboard, and ATS submission are future phases.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ PostgreSQL is the durable record; Redis is the queue/cache layer. ARQ was select
 
 ## Project layout
 
-`app/domain` contains Pydantic workflow contracts and transition rules; `app/db` contains persistence models; `app/profile` loads the authoritative YAML profile; `app/audit` redacts audit payloads; `app/workers` configures ARQ; `migrations` contains schema migrations; `tests` contains deterministic foundation tests. Later phases add discovery, matching, verification, document, approval, submission, tracking, and dashboard modules.
+`app/domain` contains Pydantic workflow contracts and transition rules; `app/db` contains persistence models; `app/profile` loads the authoritative YAML profile; `app/audit` redacts audit payloads; `app/discovery` contains public ATS source adapters, freshness checks, URL normalization, and persistence; `app/matching` contains deterministic scoring; `app/workers` configures ARQ; `migrations` contains schema migrations; `tests` contains deterministic fixture tests. Later phases add verification, documents, approval, submission, tracking, and dashboard modules.
 
 ## Local setup
 
@@ -36,11 +36,21 @@ Database and Redis data persist in Compose volumes. To reset a development datab
 
 For local Python setup, create a Python 3.12 virtual environment, then run `python -m pip install -e '.[dev]'`. Apply migrations with `alembic upgrade head`; run tests with `python -m pytest`.
 
-## Phase 1 scope
+## Discovery and matching (Phase 2)
+
+Configure public job boards using `DISCOVERY_BOARDS` in `.env`, with semicolon-separated entries such as `greenhouse:acme;lever:acme;ashby:Acme`. A board token/site/board name must be known; these endpoints do not provide cross-employer search. The ARQ worker runs configured board discovery at startup and daily at 07:00 UTC. Only explicitly listed boards are queried. Workable's current documented job API requires an employer-generated API token with the `r_jobs` scope, so it is not treated as a generally public source in this release.
+
+Greenhouse's public Job Board API supports unauthenticated GET requests for published jobs and descriptions. The adapter uses `first_published` when the board supplies it and never treats `updated_at` as publication time. Lever's public Postings API returns published postings but its documented response does not specify a publish timestamp, so those dates remain unknown. Ashby's public Job Postings API supplies `publishedAt`. Unknown or older dates are excluded. Posting pages are live-checked only when they use supported ATS hosts; redirects and unknown hosts are excluded pending a safe verification path.
+
+The deterministic match score considers skill overlap, target role, experience/seniority, workplace/location preferences, work-authorization evidence when the location gives a direct country match, and compatible disclosed salary. It returns an explanation, matched/missing profile skills, and explicit conflicts. Unknown job data remains uncertain. The score is a ranking aid and does not decide whether an application is submitted.
+
+Official source documentation: [Greenhouse Job Board API](https://docs.greenhouse.io/job-board), [Lever public Postings API](https://github.com/lever/postings-api), [Ashby Job Postings API](https://developers.ashbyhq.com/docs/public-job-posting-api).
+
+## Phase 1 foundation
 
 Included: Docker services for FastAPI, PostgreSQL, Redis, and ARQ; environment-backed settings; foundational database entities and migration; Pydantic profile and workflow models; explicit state transition validation; redaction helper for audit payloads; liveness/readiness endpoints.
 
-Not yet included: authenticated review UI, profile API, a complete transition repository/service, live discovery, LLM providers, document renderers, verification scoring, submission adapters, reminder scheduling, and production secrets/session management. No real job application is submitted by this foundation.
+Not yet included: authenticated review UI, employer verification scoring, LLM providers, document renderers, submission adapters, reminder scheduling, and production secrets/session management. No real job application is submitted by the system in these phases.
 
 ## Security and operations
 
